@@ -1,0 +1,700 @@
+//===----------------------------------------------------------------------===//
+//
+// This file is Modular Inc proprietary.
+//
+//===----------------------------------------------------------------------===//
+//
+// The kernels the on-device NPU library carries, and how a dispatch reaches
+// them. Expanded by both halves of the dispatch: the host packer
+// (`QuRTDeviceContext.cpp`) to split a launch's arguments, and the device
+// trampoline (`examples/hexagon-ondevice/mojo_npu_imp.c`) to unpack them into a
+// kernel's C signature. One file so the two cannot disagree about a kernel's
+// selector, its arity, or where an argument sits.
+//
+//   NPU_KERNEL(name, selector, bufferCount, scalarCount, call)
+//
+//   name         what `loadFunction` resolves, and the selector's suffix.
+//   selector     the number that travels on the wire, and the row's position.
+//                Declared rather than counted: see below.
+//   bufferCount  device-visible buffers, each of which becomes an argument slot
+//                of the invocation. Leading arguments of the launch.
+//   scalarCount  remaining arguments, which travel in the packed scalar block.
+//   call         the invocation, expanded on the device only. `NPU_BUFFER(i, T)`
+//                is buffer slot `i` as `T *`; `NPU_SCALAR(i, T)` is scalar `i`
+//                out of the packed block. The host discards this field.
+//
+// A selector is a signed library's ABI: the number identifies the kernel to
+// every skel already built, so rows may be appended but not reordered or
+// removed. Each row therefore declares its selector, and both halves assert at
+// compile time that the declared number is still the row's position. Stating
+// the number is what makes moving a row a build failure rather than a silent
+// renumbering of every row after it -- the case a textual merge produces when
+// two branches append at different points, which git reports as no conflict at
+// all.
+//
+//===----------------------------------------------------------------------===//
+
+NPU_KERNEL(vadd, /*selector=*/0, /*bufferCount=*/3, /*scalarCount=*/1,
+           mojo_vadd_f32(NPU_BUFFER(0, const float), NPU_BUFFER(1, const float),
+                         NPU_BUFFER(2, float), NPU_SCALAR(0, int)))
+
+NPU_KERNEL(vscale_offset, /*selector=*/1, /*bufferCount=*/2, /*scalarCount=*/3,
+           mojo_vscale_offset_f32(NPU_BUFFER(0, const float),
+                                  NPU_BUFFER(1, float), NPU_SCALAR(0, float),
+                                  NPU_SCALAR(1, float), NPU_SCALAR(2, int)))
+
+NPU_KERNEL(env_probe, /*selector=*/2, /*bufferCount=*/1, /*scalarCount=*/1,
+           mojo_npu_env_probe(NPU_BUFFER(0, uint32), NPU_SCALAR(0, int)))
+
+NPU_KERNEL(moe_create_indices, /*selector=*/3, /*bufferCount=*/6,
+           /*scalarCount=*/2,
+           mojo_moe_create_indices(NPU_BUFFER(0, const int32),
+                                   NPU_BUFFER(1, uint32), NPU_BUFFER(2, uint32),
+                                   NPU_BUFFER(3, uint32), NPU_BUFFER(4, int32),
+                                   NPU_BUFFER(5, uint32), NPU_SCALAR(0, int),
+                                   NPU_SCALAR(1, int)))
+
+NPU_KERNEL(thread_stripe_reduce, /*selector=*/4, /*bufferCount=*/4,
+           /*scalarCount=*/4,
+           mojo_npu_thread_stripe_reduce(
+               NPU_BUFFER(0, uint32), NPU_BUFFER(1, uint32),
+               NPU_BUFFER(2, uint32), NPU_BUFFER(3, int32), NPU_SCALAR(0, int),
+               NPU_SCALAR(1, int), NPU_SCALAR(2, int), NPU_SCALAR(3, int)))
+
+// `eps` and `weight_offset` are single-precision on the wire although the
+// kernel's own are `Float32` and `Scalar[dtype]`: a slot is read as the C type
+// named here, and the kernel narrows the offset itself. That keeps the
+// half-precision element type in the one place that computes with it.
+NPU_KERNEL(rms_norm, /*selector=*/5, /*bufferCount=*/4, /*scalarCount=*/5,
+           mojo_rms_norm_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                             NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+                             NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                             NPU_SCALAR(2, float), NPU_SCALAR(3, float),
+                             NPU_SCALAR(4, int)))
+
+// Half-precision on the wire and in the kernel: C = A @ B^T for M == 1, with a
+// uint32 witness buffer the kernel reports its SIMD width and per-thread ids
+// through. K and N are the inner and output extents; K is a multiple of 64.
+NPU_KERNEL(gemv, /*selector=*/6, /*bufferCount=*/4, /*scalarCount=*/2,
+           mojo_gemv_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                         NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+                         NPU_SCALAR(0, int), NPU_SCALAR(1, int)))
+
+// Row-wise softmax, half precision on the wire and in the I/O; the row max, the
+// exp sum, and the normalize run in fp32 inside the kernel. `output`, `input`,
+// then a uint32 witness the kernel reports its SIMD width and per-thread ids
+// through, as the GEMV's does. The scalars are the row count and length.
+NPU_KERNEL(softmax, /*selector=*/7, /*bufferCount=*/3, /*scalarCount=*/2,
+           mojo_softmax_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                            NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                            NPU_SCALAR(1, int)))
+
+// Rotary position embedding, one entry per convention (HF `rotate_half`, the
+// vectorized production path, and interleaved). Half precision on the wire and
+// in the I/O; cos/sin are fp32; the rotation is fp32 inside the kernel.
+// Buffers: `dst`, `x`, `freqs` (cos/sin interleaved per pair), `positions` (the
+// freqs row per output row), then a uint32 witness the kernel reports its SIMD
+// width and per-thread ids through, as the softmax's does. The scalars are the
+// row count and the per-head element count.
+NPU_KERNEL(rope_half, /*selector=*/8, /*bufferCount=*/5, /*scalarCount=*/2,
+           mojo_rope_half_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                              NPU_BUFFER(2, const float),
+                              NPU_BUFFER(3, const uint32), NPU_BUFFER(4, uint32),
+                              NPU_SCALAR(0, int), NPU_SCALAR(1, int)))
+
+NPU_KERNEL(rope_interleaved, /*selector=*/9, /*bufferCount=*/5,
+           /*scalarCount=*/2,
+           mojo_rope_interleaved_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const float), NPU_BUFFER(3, const uint32),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int)))
+
+// No-affine layer normalization (mean-subtract, variance, normalize), half
+// precision on the wire and in the I/O; the mean, variance, and normalize run in
+// fp32 inside the kernel. `output`, `input`, then a uint32 witness the kernel
+// reports its SIMD width and per-thread ids through, as the softmax's does. The
+// scalars are the row count, the row length, and `eps` (single-precision on the
+// wire, as the rms_norm's is).
+NPU_KERNEL(layernorm, /*selector=*/10, /*bufferCount=*/3, /*scalarCount=*/3,
+           mojo_layernorm_f16(NPU_BUFFER(0, __fp16),
+                              NPU_BUFFER(1, const __fp16),
+                              NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                              NPU_SCALAR(1, int), NPU_SCALAR(2, float)))
+
+// The bf16 instantiation: same wire shape and scalars, bf16 I/O. v81's qfloat
+// lowering of the bf16 vector path is what dispatching this entry exercises on
+// silicon. A buffer slot is raw bytes, so `uint16` names the 16-bit width
+// without needing a bf16 C type.
+NPU_KERNEL(layernorm_bf16, /*selector=*/11, /*bufferCount=*/3,
+           /*scalarCount=*/3,
+           mojo_layernorm_bf16(NPU_BUFFER(0, uint16),
+                               NPU_BUFFER(1, const uint16),
+                               NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                               NPU_SCALAR(1, int), NPU_SCALAR(2, float)))
+
+// Plain SiLU `out = x * sigmoid(x)` elementwise over `[num_rows, row_length]`,
+// half precision on the wire and in the I/O; the sigmoid runs in fp32 inside the
+// kernel. `output`, `input`, then a uint32 witness the kernel reports its SIMD
+// width and per-thread ids through, as the softmax's does. The scalars are the
+// row count and length. The VAE ResNets use bare SiLU.
+NPU_KERNEL(silu, /*selector=*/12, /*bufferCount=*/3, /*scalarCount=*/2,
+           mojo_silu_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                         NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                         NPU_SCALAR(1, int)))
+
+NPU_KERNEL(silu_bf16, /*selector=*/13, /*bufferCount=*/3, /*scalarCount=*/2,
+           mojo_silu_bf16(NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+                          NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                          NPU_SCALAR(1, int)))
+
+// Fused SwiGLU `out = silu(gate) * up`, the FLUX.2 FFN gate. `input` is
+// `[num_rows, 2*inner_dim]`: each row's first `inner_dim` elements are the gate
+// and the next `inner_dim` the up projection, the split-half layout
+// `chunk(x, 2, axis=-1)` produces. `output` is `[num_rows, inner_dim]`. Half
+// precision on the wire and in the I/O; the sigmoid and product run in fp32.
+// The witness is the softmax's; the scalars are the row count, `inner_dim`,
+// and the input row pitch in elements — `2*inner_dim` when the input is dense,
+// the projection's full width when the packed pair is a column slice of a
+// wider fused projection (FLUX.2's single-stream blocks), whose start rides in
+// the buffer's own offset as every operand's does.
+NPU_KERNEL(swiglu, /*selector=*/14, /*bufferCount=*/3, /*scalarCount=*/3,
+           mojo_swiglu_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                           NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                           NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+NPU_KERNEL(swiglu_bf16, /*selector=*/15, /*bufferCount=*/3, /*scalarCount=*/3,
+           mojo_swiglu_bf16(NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+                            NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                            NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+// HVX-only flash attention (Track 1), dense non-causal, no KV cache. Half
+// precision on the wire and in the I/O; the QK^T dot, the online softmax, and
+// the P@V accumulate run in fp32 inside the kernel. Buffers: `O` (output), then
+// `Q`, `K`, `V`, then a uint32 witness the kernel reports its SIMD width and
+// per-thread ids through, as the softmax's does. The scalars are the sequence
+// length, the head count, the softmax scale (single-precision on the wire, as
+// the rms_norm's eps is), and `rt` (reserved for the Track-2 HMX row-tile,
+// unused on this HVX path).
+NPU_KERNEL(mha_no_cache, /*selector=*/16, /*bufferCount=*/5, /*scalarCount=*/4,
+           mojo_mha_no_cache_f16(NPU_BUFFER(0, __fp16),
+                                 NPU_BUFFER(1, const __fp16),
+                                 NPU_BUFFER(2, const __fp16),
+                                 NPU_BUFFER(3, const __fp16),
+                                 NPU_BUFFER(4, uint32), NPU_SCALAR(0, int),
+                                 NPU_SCALAR(1, int), NPU_SCALAR(2, float),
+                                 NPU_SCALAR(3, int)))
+
+// adaLN modulation `out = (1 + scale) * x + shift`, the affine an MMDiT block
+// applies to its normalized activation. `scale` and `shift` are per-channel
+// vectors broadcast across the token rows: `param_row_stride == 0` shares one
+// length-D vector across every row (the FLUX case, modulation from a [B, D]
+// temb), `== row_length` is a materialized [rows, D]. Half precision on the wire
+// and in the I/O; the affine runs in fp32. Buffers: output, x, scale, shift,
+// then a uint32 witness the kernel reports its SIMD width and per-thread ids
+// through, as the softmax's does. The scalars are the row count, the row length,
+// and the parameter stride.
+NPU_KERNEL(ada_modulate, /*selector=*/17, /*bufferCount=*/5, /*scalarCount=*/3,
+           mojo_ada_modulate_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, const __fp16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int)))
+
+NPU_KERNEL(ada_modulate_bf16, /*selector=*/18, /*bufferCount=*/5,
+           /*scalarCount=*/3,
+           mojo_ada_modulate_bf16(
+               NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+               NPU_BUFFER(2, const uint16), NPU_BUFFER(3, const uint16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int)))
+
+// Gated residual `out = x + gate * y`, closing each MMDiT sub-block. `gate` is a
+// per-channel vector like the modulation params; `gate_row_stride == 0` shares
+// one length-D vector across the rows, `== row_length` is a materialized
+// [rows, D]. Buffers: output, x, y, gate, then the softmax's witness; the
+// scalars are the row count, the row length, and the gate stride.
+NPU_KERNEL(gate_residual, /*selector=*/19, /*bufferCount=*/5, /*scalarCount=*/3,
+           mojo_gate_residual_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, const __fp16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int)))
+
+NPU_KERNEL(gate_residual_bf16, /*selector=*/20, /*bufferCount=*/5,
+           /*scalarCount=*/3,
+           mojo_gate_residual_bf16(
+               NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+               NPU_BUFFER(2, const uint16), NPU_BUFFER(3, const uint16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int)))
+// Affine group normalization over `[N, C, spatial]` — the FLUX.2 VAE decoder's
+// norm. Each `(n, group)` block of `(C/num_groups)*spatial` contiguous elements
+// is mean/variance normalized (both in fp32 inside the kernel), then a
+// per-channel `gamma` / `beta` applies. Buffers: `output`, `input`, `gamma`,
+// `beta` (each length `C`), then a uint32 witness the kernel reports its SIMD
+// width and per-thread ids through, as the layernorm's does. Half precision on
+// the wire and in the I/O. The scalars are `N`, `C`, `spatial`, `num_groups`,
+// and `eps` (single-precision on the wire, as the layernorm's is).
+NPU_KERNEL(groupnorm, /*selector=*/21, /*bufferCount=*/5, /*scalarCount=*/5,
+           mojo_groupnorm_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, const __fp16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int), NPU_SCALAR(3, int), NPU_SCALAR(4, float)))
+
+// The bf16 instantiation: same wire shape and scalars, bf16 I/O. v81's qfloat
+// lowering of the bf16 vector path is what dispatching this entry exercises on
+// silicon. A buffer slot is raw bytes, so `uint16` names the 16-bit width
+// without needing a bf16 C type, as the layernorm_bf16's does.
+NPU_KERNEL(groupnorm_bf16, /*selector=*/22, /*bufferCount=*/5,
+           /*scalarCount=*/5,
+           mojo_groupnorm_bf16(
+               NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+               NPU_BUFFER(2, const uint16), NPU_BUFFER(3, const uint16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int), NPU_SCALAR(3, int), NPU_SCALAR(4, float)))
+
+// Causal + padding masked flash attention (the Qwen3 text encoder, P4): the
+// `mha_no_cache` kernel with one extra buffer, an additive score mask. `bias` is
+// `[seq_len, seq_len]` fp32 (single-precision on the wire), 0 where visible and a
+// large negative where masked, broadcast across heads; the kernel adds
+// `bias[query, key]` to each score before the online-softmax max. Buffers: `O`,
+// `Q`, `K`, `V`, `bias`, then the softmax's uint32 witness. The scalars are the
+// sequence length, the head count, the scale, and `rt` (reserved, unused on HVX),
+// as `mha_no_cache`'s are.
+NPU_KERNEL(mha_masked, /*selector=*/23, /*bufferCount=*/6, /*scalarCount=*/4,
+           mojo_mha_masked_f16(NPU_BUFFER(0, __fp16),
+                               NPU_BUFFER(1, const __fp16),
+                               NPU_BUFFER(2, const __fp16),
+                               NPU_BUFFER(3, const __fp16),
+                               NPU_BUFFER(4, const float),
+                               NPU_BUFFER(5, uint32), NPU_SCALAR(0, int),
+                               NPU_SCALAR(1, int), NPU_SCALAR(2, float),
+                               NPU_SCALAR(3, int)))
+
+// Batched/tiled matmul C[M, N] = A[M, K] @ B[N, K]^T, the many-rows-per-dispatch
+// GEMV: one dispatch computes the whole output instead of one row. Half precision
+// on the wire and in the I/O, fp32 accumulate. Buffers: `C`, `A`, `B`, then a
+// uint32 witness the kernel reports its SIMD width and per-thread ids through, as
+// the GEMV's does. The scalars are M (the A-row count), N (the output extent),
+// and K (the inner extent, a multiple of 64). Same b_transposed [N, K] weight
+// layout as the GEMV; appended after it so the GEMV's selector does not move.
+NPU_KERNEL(matmul, /*selector=*/24, /*bufferCount=*/4, /*scalarCount=*/3,
+           mojo_matmul_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                           NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+                           NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                           NPU_SCALAR(2, int)))
+
+// `gate_residual` with the sum bounded to fp16's finite range before the store,
+// the fp16 guard `transformer_flux2.py` applies to the stream a block closes
+// over: the joint stream after a single block, and the text stream after a
+// double block's feed-forward. Same wire shape and scalars as `gate_residual`;
+// a separate selector rather than a flag so the sub-blocks the reference leaves
+// unguarded keep dispatching the unclamped kernel. Appended last so no existing
+// selector moves. No bf16 form -- bf16 carries fp32's exponent range.
+NPU_KERNEL(gate_residual_clamp, /*selector=*/25, /*bufferCount=*/5,
+           /*scalarCount=*/3,
+           mojo_gate_residual_clamp_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, const __fp16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int)))
+
+// Interchangeable with `rms_norm` above, and deliberately identical in shape:
+// same buffers, same scalars, same row split. Only where the compute reads and
+// writes differs, so one host can run both against one reference. Appended last
+// so no existing selector moves.
+NPU_KERNEL(rms_norm_staged, /*selector=*/26, /*bufferCount=*/4,
+           /*scalarCount=*/5,
+           mojo_rms_norm_f16_staged(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+               NPU_SCALAR(0, int), NPU_SCALAR(1, int), NPU_SCALAR(2, float),
+               NPU_SCALAR(3, float), NPU_SCALAR(4, int)))
+
+// Stages a slice of DDR into VTCM and back out again, so the transport can be
+// established apart from any kernel computing out of it. Buffers: source,
+// destination, then a uint32 witness each participant reports through. The
+// scalars are the word count, an offset shifting the VTCM slice off the vector
+// boundary it would otherwise start on, and a mode selecting which legs run --
+// the controls the round trip is checked against. Appended last so no existing
+// selector moves.
+NPU_KERNEL(udma_roundtrip, /*selector=*/27, /*bufferCount=*/3,
+           /*scalarCount=*/3,
+           mojo_npu_udma_roundtrip(NPU_BUFFER(0, const uint32),
+                                   NPU_BUFFER(1, uint32), NPU_BUFFER(2, uint32),
+                                   NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                                   NPU_SCALAR(2, int)))
+
+// A kernel that does no work, so that a dispatch of it prices the launch alone.
+// One buffer, a uint32 witness each participant marks its own slot of, and its
+// word capacity. Appended last so no existing selector moves.
+NPU_KERNEL(launch_probe, /*selector=*/28, /*bufferCount=*/1, /*scalarCount=*/1,
+           mojo_npu_launch_probe(NPU_BUFFER(0, uint32), NPU_SCALAR(0, int)))
+
+// INT8 W8A8 HMX matmul: C[m_pad, n_pad] int32 = A(uint8) @ B(int8), the MAC run
+// on the HMX unit under `qurt_hmx_lock2` (via the `hmx_int8_shim.c` public
+// intrinsics). `out` receives the RAW int32 accumulator tiles (no requant) for
+// an off-device dequant / byte-order check; `a_cr` and `b_cr` are the crouton-
+// packed operands (host-packed for the layout experiment). The uint32 witness
+// carries the HMX lock status and per-thread ids as the other kernels' does. The
+// scalars are the padded M/K/N and the mxmem range/control word `rt`.
+// Appended last so no existing selector moves.
+NPU_KERNEL(hmx_int8_probe, /*selector=*/29, /*bufferCount=*/4,
+           /*scalarCount=*/4,
+           mojo_hmx_int8_probe(NPU_BUFFER(0, uint8), NPU_BUFFER(1, const uint8),
+                               NPU_BUFFER(2, const int8), NPU_BUFFER(3, uint32),
+                               NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                               NPU_SCALAR(2, int), NPU_SCALAR(3, int)))
+
+// The bf16 instantiation of `rms_norm`: same wire shape and scalars, bf16 I/O.
+// `eps` and `weight_offset` stay single-precision on the wire and the kernel
+// narrows the offset itself, as the fp16 row's does. A buffer slot is raw bytes,
+// so `uint16` names the 16-bit width without needing a bf16 C type, as the
+// layernorm_bf16's does. Appended last so no existing selector moves.
+NPU_KERNEL(rms_norm_bf16, /*selector=*/30, /*bufferCount=*/4,
+           /*scalarCount=*/5,
+           mojo_rms_norm_bf16(NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+                              NPU_BUFFER(2, const uint16), NPU_BUFFER(3, uint32),
+                              NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                              NPU_SCALAR(2, float), NPU_SCALAR(3, float),
+                              NPU_SCALAR(4, int)))
+
+// The bf16 instantiations of the two RoPE conventions: same wire shape and
+// scalars, bf16 head vectors. `freqs` stays fp32 in both, the rotation being
+// fp32 inside the kernel regardless of the I/O width. Appended last so no
+// existing selector moves.
+NPU_KERNEL(rope_half_bf16, /*selector=*/31, /*bufferCount=*/5,
+           /*scalarCount=*/2,
+           mojo_rope_half_bf16(
+               NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+               NPU_BUFFER(2, const float), NPU_BUFFER(3, const uint32),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int)))
+
+NPU_KERNEL(rope_interleaved_bf16, /*selector=*/32, /*bufferCount=*/5,
+           /*scalarCount=*/2,
+           mojo_rope_interleaved_bf16(
+               NPU_BUFFER(0, uint16), NPU_BUFFER(1, const uint16),
+               NPU_BUFFER(2, const float), NPU_BUFFER(3, const uint32),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int)))
+
+// Times one participant's read of a fixed DDR slice through one transport, so
+// that an exposed miss latency and a transport ceiling can be told apart.
+// Buffers: the source to read, then a uint32 witness each participant reports
+// its two counter deltas through. The scalars are the source's word count, the
+// chunk the slice is walked in, and the transport. Appended last so no existing
+// selector moves.
+NPU_KERNEL(membw_probe, /*selector=*/33, /*bufferCount=*/2, /*scalarCount=*/3,
+           mojo_npu_membw_probe(NPU_BUFFER(0, const uint32),
+                                NPU_BUFFER(1, uint32), NPU_SCALAR(0, int),
+                                NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+// The timestep sinusoidal embedding table (diffusers
+// `get_timestep_embedding`): `[num_rows]` fp32 timesteps in, `[num_rows,
+// 2*half_dim]` fp16 out, one half cosines and the other sines, cosines first
+// when `flip != 0`. Deliberately scalar inside -- fp32/fp64 IEEE arithmetic
+// rather than the qfloat vector path -- so the host check compares exactly;
+// the witness is the softmax's. The scalars are the row count, `half_dim`,
+// the timestep scale, the band coefficient `-ln(max_period)` (precomputed on
+// the host: the graph constant-folds its own log and the skel links no libm),
+// and the half order. Appended last so no existing selector moves.
+NPU_KERNEL(sinusoid_embed, /*selector=*/34, /*bufferCount=*/3,
+           /*scalarCount=*/5,
+           mojo_sinusoid_embed_f16(NPU_BUFFER(0, __fp16),
+                                   NPU_BUFFER(1, const float),
+                                   NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                                   NPU_SCALAR(1, int), NPU_SCALAR(2, float),
+                                   NPU_SCALAR(3, float), NPU_SCALAR(4, int)))
+
+// One rope axis's fp32 (cos, sin) table (diffusers
+// `get_1d_rotary_pos_embed`), in the interleaved pair layout the `rope_half`
+// / `rope_interleaved` selectors read as `freqs`: `out[s, 2k] = cos(pos_s *
+// freq_k)`, `out[s, 2k + 1] = sin(...)`. `positions` are the raw si64 ids --
+// the fp32 cast happens at the kernel's load -- stepped by a stride so one
+// dispatch reads its axis's column straight out of the packed `[rows,
+// num_axes]` id tensor with no slice materialized; `freqs` is the axis's
+// `[half_dim]` fp32 frequency row, a graph constant. Scalar inside, as the
+// sinusoid row is. The scalars are the row count, `half_dim`, and the
+// position stride in elements. Appended last so no existing selector moves.
+NPU_KERNEL(rope_table, /*selector=*/35, /*bufferCount=*/4, /*scalarCount=*/3,
+           mojo_rope_table_f32(NPU_BUFFER(0, float), NPU_BUFFER(1, const int64),
+                               NPU_BUFFER(2, const float),
+                               NPU_BUFFER(3, uint32), NPU_SCALAR(0, int),
+                               NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+// A stride-1 convolution as the matmul over a FUSED online im2col: the same
+// b-transposed weight contract and witness as `matmul`, but the A operand is the
+// NHWC input map itself and the gather runs inside the kernel, so the `M x K`
+// im2col matrix is never built and never crosses the transport. Buffers: `C`
+// (`[H_out*W_out, C_out]`), the input map (`[H, W, C_in]`), the filter
+// (`[C_out, R*S*C_in]`, channel FASTEST within a tap), then the uint32 witness.
+// The scalars are the input extents, the output channel count, the filter
+// window, the padding, and the output extents. `C_in` must be a multiple of 64:
+// that is what makes each gathered A vector one contiguous 128-byte load, and it
+// makes `K = R*S*C_in` a multiple of 64 so this selector needs none of the K
+// padding `matmul` carries. Appended last so no existing selector moves.
+NPU_KERNEL(conv_im2col, /*selector=*/36, /*bufferCount=*/4,
+           /*scalarCount=*/10,
+           mojo_conv_im2col_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+               NPU_SCALAR(0, int), NPU_SCALAR(1, int), NPU_SCALAR(2, int),
+               NPU_SCALAR(3, int), NPU_SCALAR(4, int), NPU_SCALAR(5, int),
+               NPU_SCALAR(6, int), NPU_SCALAR(7, int), NPU_SCALAR(8, int),
+               NPU_SCALAR(9, int)))
+
+// Session power, not a compute kernel. Dispatched once right after the skel
+// opens (default on; `MODULAR_NPU_POWER=0` disables): `enable` 1 places the
+// session-long HAP_power vote (DCVS v3 pinned MAX with sleep disabled, HVX
+// rail up, HMX clock pinned -- the shape the shipped ggml-hexagon backend
+// holds for its whole session), 0 releases it; `mojo_npu_close` releases it
+// regardless. The report is its own buffer, not the witness protocol: word 0
+// says whether `HAP_power_set` was resident, words 1-4 carry the four votes'
+// statuses, word 5 carries 'HMX1' iff the skel was built with HMX_MATMUL=1
+// (written on both arms -- the host's unvoted-session HMX refusal reads it,
+// P5 M2.4 order 077), and `word_capacity` bounds the writer so a shorter
+// report is truncated rather than overrun. A signed skel that predates this
+// row refuses the selector by name, which the host reports and survives.
+NPU_KERNEL(power_vote, /*selector=*/37, /*bufferCount=*/1, /*scalarCount=*/2,
+           mojo_npu_power_vote(NPU_BUFFER(0, uint32), NPU_SCALAR(0, int),
+                               NPU_SCALAR(1, int)))
+
+// The queue drain's post-mortem, not a compute kernel: copies the report the
+// drain keeps in skel .bss (`NPUQueueWire.h` names the words) into the one
+// buffer, up to `word_capacity` words. Dispatched over the synchronous
+// transport by the host AFTER the queue has gone silent -- which is the one
+// moment the queue itself cannot answer -- so a 074-class hang is read back
+// (import mode and rc, the echoed queue id, read rc, last frame's magic and
+// parse status, pending packets) instead of reconstructed from a mini-dm this
+// box does not have. A signed skel that predates this row refuses the
+// selector by name, which the host reports and survives.
+NPU_KERNEL(queue_report, /*selector=*/38, /*bufferCount=*/1, /*scalarCount=*/1,
+           mojo_npu_queue_report(NPU_BUFFER(0, uint32), NPU_SCALAR(0, int)))
+
+// The step table's transport row, not a compute kernel. `MODULAR_NPU_MEGASTEP=1`
+// sends a whole host-ordered launch table -- a denoise step is ~403 launches --
+// as one dispatch under this selector, and the device walks it through
+// `npu_run_launch` locally (`npu_run_megastep`, mojo_npu_imp.c). The block
+// rides the length-delimited scalar area past the two declared scalars,
+// exactly as a batch block and every launch's offset words already do, so the
+// interface and its md5 are unmoved. The entry point intercepts this selector
+// before any launch machinery runs, and `npu_run_launch` refuses it outright,
+// so the call expression below is unreachable on every path: a transport that
+// bypassed the entry point cannot run a table as if it were one kernel's
+// arguments. A signed skel predating this row refuses the selector by name
+// (`npu_args_ok` knows no such row) and the session survives. Appended last so
+// no existing selector moves.
+NPU_KERNEL(megastep, /*selector=*/39, /*bufferCount=*/1, /*scalarCount=*/2,
+           (void)0)
+
+// `conv_im2col` computed on the HMX array instead of HVX: identical buffers,
+// identical scalars, identical contract, and a different selector. A separate
+// row rather than a flag inside 36 because 36 is what the graph path dispatches
+// unconditionally (`registrations.mojo:2872`), so an array arm behind it would
+// move the graph VAE's numerics with no gate between; here an older signed skel
+// refuses this row by name and the caller keeps the vector arm. The array folds
+// in a different order from `mm_reduce_add`, so this selector's output is equal
+// to 36's within a tolerance band and never bitwise -- do not treat the pair as
+// a byte-identity control. Two further conditions the wire cannot carry: on a
+// SKYE_HMX_WEIGHTS_NATIVE skel the filter must be a crouton artefact and on any
+// other skel it must be row-major (there is no layout argument, so the caller
+// owns that, `npu_registry_load.h:154`), and a skel built without HMX_MATMUL=1
+// runs the vector body here, which witness word 18's `MATMUL_ARM_CONV` bit is
+// what distinguishes. Appended last so no existing selector moves.
+NPU_KERNEL(conv_im2col_hmx, /*selector=*/40, /*bufferCount=*/4,
+           /*scalarCount=*/10,
+           mojo_conv_im2col_hmx_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+               NPU_SCALAR(0, int), NPU_SCALAR(1, int), NPU_SCALAR(2, int),
+               NPU_SCALAR(3, int), NPU_SCALAR(4, int), NPU_SCALAR(5, int),
+               NPU_SCALAR(6, int), NPU_SCALAR(7, int), NPU_SCALAR(8, int),
+               NPU_SCALAR(9, int)))
+
+// Transpose `[R, N] -> [N, R]`, adding `bias[n]` to every element of output
+// row `n`. Not a new compute primitive: it is the VAE decode's layout round
+// trip (`VAE_CODE_CRITIQUE.md` finding F4) moved on-device. The host driver
+// ran the SAME operation twice per conv on the ARM host, at up to 512 KiB
+// destination stride -- `scatterConvRows` turning the fused conv kernel's raw
+// `[M, C_out]` result into `[C_out, spatial]` (CHW, GroupNorm's channel-major
+// ABI) while adding the per-channel bias the conv kernel has no buffer for,
+// and `nhwc_from_chw` turning the next conv's CHW activation back into the
+// `[H, W, C_in]` map the fused im2col gather reads. Buffers: the `[N, R]`
+// output, the `[R, N]` input, the `[N]` bias row (the pure-transpose leg
+// passes a zero-filled row rather than the kernel testing a flag), then the
+// uint32 witness. The scalars are `R` and `N`. Appended last so no existing
+// selector moves.
+NPU_KERNEL(transpose_bias, /*selector=*/41, /*bufferCount=*/4,
+           /*scalarCount=*/2,
+           mojo_transpose_bias_f16(NPU_BUFFER(0, __fp16),
+                                   NPU_BUFFER(1, const __fp16),
+                                   NPU_BUFFER(2, const __fp16),
+                                   NPU_BUFFER(3, uint32), NPU_SCALAR(0, int),
+                                   NPU_SCALAR(1, int)))
+
+// Times the HMX operand stream itself, which selector 33 (`membw_probe`) does
+// not: that one reads with HVX vector loads, so its rate is a core-side read
+// rate and never the array's operand port (order 159R sec 3). The single buffer
+// is `membw_probe`'s own witness, same stride and same word layout, so one
+// reader decodes both; the scalars are the croutons of depth each pass streams,
+// the passes to time, and the addressing form (`:deep` or plain). Synthetic
+// operands, staged in VTCM by the kernel because `mxmem` faults on DDR, so
+// nothing travels in. Appended last so no existing selector moves.
+NPU_KERNEL(mxmem_port_probe, /*selector=*/42, /*bufferCount=*/1,
+           /*scalarCount=*/3,
+           mojo_npu_mxmem_port_probe(NPU_BUFFER(0, uint32), NPU_SCALAR(0, int),
+                                     NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+// The annihilation rung-1 bench (re-sign window item 7), not a production
+// kernel: one dispatch runs ONE stage-arm of the crouton-crossing microbench
+// at klein_mini geometry — (baseline|native) x (FF|swiglu|FFO), six protocol
+// dispatches over one scratch buffer, plus the falsify stage as the verdict's
+// must-fire control — so the HMX_PHASE_PROBE table attributes per dispatch.
+// `scratch` is raw bytes the kernel carves itself (`ANNI_SCRATCH_BYTES`,
+// `hmx_annihilation_bench.mojo`); the scalars are the arm, the stage, and the
+// scratch byte capacity, refused by name when short. The uint32 witness (>= 32
+// words) carries the matmul map's grant/path/fingerprint words plus the bench's
+// marker, echoes and verdict count. fp16 on every skel; the native arms are
+// bare comptime parameters, so no build define gates this row's behavior. A
+// signed skel that predates this row refuses the selector by name, which the
+// host reports and survives. Appended last so no existing selector moves.
+NPU_KERNEL(hmx_annihilation_bench, /*selector=*/43, /*bufferCount=*/2,
+           /*scalarCount=*/3,
+           mojo_hmx_annihilation_bench(NPU_BUFFER(0, uint8),
+                                       NPU_BUFFER(1, uint32),
+                                       NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                                       NPU_SCALAR(2, int)))
+
+// The standalone HMX characterization bench (re-sign window queue item 8): the
+// iters-amortized int8 pure-array sibling of `mxmem_port_probe` — order 184's
+// fp16-sibling gap; selector 29's single chain brackets its feeders and cannot
+// be a ratio — plus the same fp16 arms under one bracket for the ratio's
+// denominator, plus the VTCM->DDR movement direction `membw_probe` does not
+// cover (uDMA writeback and HVX stores, per-transfer completion). Buffers: the
+// movement modes' DDR sink — its own slot because a kernel can only deref a
+// buffer passed as its own pointer argument — then `membw_probe`'s witness,
+// same stride and word layout, so the one reader decodes all three probes. The
+// scalars are the mode, the croutons of depth (modes 0-2) or the panel whose
+// feeder share is the transfer grain (modes 3-4), the pass/chunk count, and
+// the uDMA mode's ring depth (window item 9's knob on the item-9 descriptor
+// ring; 1 everywhere else, refused otherwise). The depth scalar widened this
+// row from 3 scalars to 4 BEFORE its first signing -- rows 43 and 44 merged
+// pre-window (2026-08-15) but no skel carrying them has been signed, so the
+// wire ships once, already 4-wide; order text quoting `(mode, k_tiles,
+// iters)` gains `depth=1`. Pass bodies, fills, accounting and refusal floors
+// live in `hmx_standalone_bench.mojo`, host-gated. Appended last so no
+// existing selector moves.
+NPU_KERNEL(hmx_bench, /*selector=*/44, /*bufferCount=*/2, /*scalarCount=*/4,
+           mojo_npu_hmx_bench(NPU_BUFFER(0, uint8), NPU_BUFFER(1, uint32),
+                              NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+                              NPU_SCALAR(2, int), NPU_SCALAR(3, int)))
+
+// `conv_im2col_hmx` plus the output-store epilogue: `C = conv + bias[n]
+// (+ resid[m, n])`. A separate row rather than a mode word on 40 for 40's own
+// stated reasons one row up the file: the residual needs a fifth buffer the
+// signed 4-buffer row cannot carry, and an epilogue arm behind 40 would move
+// the numerics its certification banked with no gate between; an older signed
+// skel refuses this row by name and the caller keeps 40 + host adds. Buffers:
+// `C`, the input map, the filter artefact WITH ITS BIAS TAIL (front matter
+// exactly as 40 reads it, then one fp16 per-channel row at element offset
+// `N * K` -- the int8 requant-record precedent: per-channel constants travel
+// with the weight; a conv without bias stages a zero row, never a flag), the
+// uint32 witness, the residual (`[H_out*W_out, C_out]` fp16, three-input and
+// never in-place -- the shipped ggml-hexagon backend's MUL_MAT_ADD shape),
+// and the GroupNorm `a, b` rows the phase-ii pack fold will read (bound,
+// zero-filled/identity until that batch lands). The scalars are 40's ten plus
+// `resid_present` (runtime data -- witness word 18's epilogue bit and unpack
+// arm codes 6/7 echo which arm actually RAN) and `upsample_log2`, declared
+// from day one and refused by this skel (witness slot 7) so the later
+// upsample-gather batch moves no ABI. Appended last so no existing selector
+// moves.
+NPU_KERNEL(conv_im2col_hmx_ep, /*selector=*/45, /*bufferCount=*/6,
+           /*scalarCount=*/12,
+           mojo_conv_im2col_hmx_ep_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+               NPU_BUFFER(4, const __fp16), NPU_BUFFER(5, const __fp16),
+               NPU_SCALAR(0, int), NPU_SCALAR(1, int), NPU_SCALAR(2, int),
+               NPU_SCALAR(3, int), NPU_SCALAR(4, int), NPU_SCALAR(5, int),
+               NPU_SCALAR(6, int), NPU_SCALAR(7, int), NPU_SCALAR(8, int),
+               NPU_SCALAR(9, int), NPU_SCALAR(10, int), NPU_SCALAR(11, int)))
+
+// GroupNorm's per-channel APPLY ROWS, without touching the map: `ab[n, 0, c]
+// = gamma[c] * rstd(n, g)`, `ab[n, 1, c] = beta[c] - mean(n, g) * ab[n, 0,
+// c]`. The producer half of the stats/apply split the conv epilogue package's
+// input-side fold consumes -- the normalize-apply becomes one fp16 FMA per
+// element inside the conv's own pack, and the intermediate normalized map is
+// never written. The reductions are selector 21's own two passes over the
+// same views (mean and variance in fp32), so the pair cannot disagree about a
+// mean; a separate row rather than an arm on 21 because even provably dead
+// code added to a signed body moves its schedule (the transpose_bias record
+// one file over). Buffers: the `[N, 2, C]` `ab` output, `input`, `gamma`,
+// `beta`, then the uint32 witness; the scalars are selector 21's five,
+// unchanged. Batched into the same re-sign window as row 45. Appended last so
+// no existing selector moves.
+NPU_KERNEL(groupnorm_stats, /*selector=*/46, /*bufferCount=*/5,
+           /*scalarCount=*/5,
+           mojo_groupnorm_stats_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, const __fp16),
+               NPU_BUFFER(4, uint32), NPU_SCALAR(0, int), NPU_SCALAR(1, int),
+               NPU_SCALAR(2, int), NPU_SCALAR(3, int), NPU_SCALAR(4, float)))
+
+// Batched 2-D relayout: `output[b][j][i] = input[b][i][j]`, `input` `[batch,
+// rows, cols]`, `output` `[batch, cols, rows]`, dense fp16. The serve graph's
+// surviving `mogg.call.materialize` permutes -- 77 sites, 14.36 s of the
+// 17.824 s host pool per the walk census -- are each, per batch index,
+// exactly this primitive: NCHW -> NHWC is `(N, C, H*W)` and NHWC -> NCHW is
+// `(N, H*W, C)`, so both directions ride one row with no direction scalar.
+// Not an arm on `transpose_bias` (41): that row's contract carries a
+// mandatory bias buffer the materialize seam would have to zero-stage per
+// dispatch, and its SIGNED body is the scalar walk (the vector arm sits
+// behind a build define whose flip would move certified bytes); this row
+// ships the 64x64 riffle-network transpose as its only body. The host routes
+// only views that fold to this shape (`MODULAR_NPU_RELAYOUT_DEVICE=1`,
+// `registrations.mojo`) and keeps its own walk for everything else -- and on
+// an older signed skel this selector is refused by name and the caller keeps
+// the host walk, this port's degradation mode. Witness word 7 echoes ran (1)
+// or refused-extent (2); the scalars are the batch count and the input's
+// `rows` and `cols`. Appended last so no existing selector moves.
+NPU_KERNEL(relayout, /*selector=*/47, /*bufferCount=*/3, /*scalarCount=*/3,
+           mojo_relayout_f16(NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+                             NPU_BUFFER(2, uint32), NPU_SCALAR(0, int),
+                             NPU_SCALAR(1, int), NPU_SCALAR(2, int)))
+
+// Two INDEPENDENT `matmul` dispatches under one launch: `C0 = A0 @ B0^T` and
+// `C1 = A1 @ B1^T`, each member exactly selector 24's contract (fp16 wire,
+// [N, K] transposed weights, K a multiple of 64, its OWN trailing uint32
+// witness with selector 24's slot vocabulary). One launch pays the per-launch
+// fixed cost once for two dispatches' work -- the 5-thread fan-out, the VTCM
+// grant resolution, and the HMX grant whose RELEASE clears the accumulators
+// (the fixed-per-chain-cost signature the order-254 split measured). A PAIR
+// and not a wider table because eight buffers is the transport's entire slot
+// budget (`kNPUMaxBufferSlots`): 2 x (C, A, B, witness) fills it exactly, a
+// third member cannot ride a fixed-arity row, and a slot-indexed table would
+// need the megastep's session machinery -- the host grouper splits wider
+// independent runs into pair + remainder instead. Per-member witnesses rather
+// than one double-wide buffer so the host's arena slots, guard records and
+// flush walk read each member with the existing layout; the host walks BOTH
+// slots for this selector (`evaluateWitnessGuards`), and a mid-chain failure
+// names its member through its own slot 7. The members must be provably
+// independent -- the host grouper refuses any pair whose output byte-range
+// intersects the other's operands -- and the kernel runs them strictly in
+// order, so no dependency edge can be reordered (the order-280 conservation
+// law, held by construction). At eight buffers the per-launch device-timing
+// report has no free slot and this row goes untimed; the dispatch recorder
+// and the witnesses still cover it. A signed skel that predates this row
+// refuses the selector by name, which the host reports, and the caller keeps
+// dispatching selector 24 singletons -- this port's degradation mode.
+// Appended last so no existing selector moves.
+NPU_KERNEL(matmul_chain2, /*selector=*/48, /*bufferCount=*/8,
+           /*scalarCount=*/6,
+           mojo_matmul_chain2_f16(
+               NPU_BUFFER(0, __fp16), NPU_BUFFER(1, const __fp16),
+               NPU_BUFFER(2, const __fp16), NPU_BUFFER(3, uint32),
+               NPU_BUFFER(4, __fp16), NPU_BUFFER(5, const __fp16),
+               NPU_BUFFER(6, const __fp16), NPU_BUFFER(7, uint32),
+               NPU_SCALAR(0, int), NPU_SCALAR(1, int), NPU_SCALAR(2, int),
+               NPU_SCALAR(3, int), NPU_SCALAR(4, int), NPU_SCALAR(5, int)))
+
+#undef NPU_KERNEL

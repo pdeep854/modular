@@ -26,10 +26,26 @@ link_hack(
 )
 
 register_toolchains(
+    # Must precede the wildcard below: windows-arm64-toolchain has no
+    # target_compatible_with constraint, so the wildcard would win for a
+    # windows target without this explicit ordering.
+    "//bazel/internal/cc-toolchain:windows-arm64-toolchain",
     "//bazel/internal:mojo_toolchain",
     "//bazel/internal/cc-toolchain:all",
     "//bazel/internal:mojo_copts_toolchain",
     "//bazel/internal:pyo3_toolchain",
+)
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+# Cross toolchain for the windows-arm64 target platform. Prebuilt, linux-aarch64
+# hosted, so a Windows ARM64 binary can be produced without a Windows machine.
+http_archive(
+    name = "llvm-mingw",
+    build_file = "//bazel/third-party:llvm-mingw.BUILD",
+    sha256 = "e7e5d135d93d3f2a3beaaea633a5b0e66ac75391a53feae654391913dd76102b",
+    strip_prefix = "llvm-mingw-20260616-ucrt-ubuntu-22.04-aarch64",
+    url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-aarch64.tar.xz",
 )
 
 include("//bazel/public-patches:llvm.MODULE.bazel")

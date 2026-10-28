@@ -198,6 +198,8 @@ Device::API mapAPI(StringRef api) {
     return Device::hipAPI;
   if (api == Device::metalAPI)
     return Device::metalAPI;
+  if (api == Device::npuAPI)
+    return Device::npuAPI;
   return Device::gpuAPI;
 }
 

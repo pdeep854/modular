@@ -1,0 +1,24 @@
+load("@@//bazel:api.bzl", "mojo_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Graph tests consume this filegroup as a `custom_extensions` source input, the
+# way `../qaic` is consumed; the compiled `mojo_library` below is what an
+# `InferenceSession.load(custom_extensions=...)` takes.
+filegroup(
+    name = "hexagon_ondevice_srcs",
+    srcs = glob(["**/*.mojo"]),
+)
+
+mojo_library(
+    name = "hexagon_ondevice",
+    srcs = glob(["**/*.mojo"]),
+    validate_missing_docs = False,
+    deps = [
+        "//stdlib/std",
+        "@@//max:extensibility",
+        "@@//max:layout",
+        "@@//max:max_mojo",
+        "@@//max/kernels/src/graph_compiler/builtin_primitives",
+    ],
+)

@@ -148,6 +148,7 @@ public:
   using API = StringLiteral;
   static constexpr API cpuAPI = "cpu";     // Generic CPU device
   static constexpr API gpuAPI = "gpu";     // Generic GPU device
+  static constexpr API npuAPI = "npu";     // Generic NPU device
   static constexpr API cudaAPI = "cuda";   // NVIDIA CUDA device
   static constexpr API hipAPI = "hip";     // AMDGPU HIP device
   static constexpr API metalAPI = "metal"; // Apple Metal device
@@ -306,6 +307,13 @@ public:
   static ErrorOr<bool> allPeerAccessEnabled();
 
   static ErrorOr<DeviceRef> create(StringRef api, int id = 0);
+
+  // Seam for the statically-linked on-device QuRT NPU backend.
+  // A weak-linked no-op when the QuRT backend is not in the link closure;
+  // QuRTDeviceContext.cpp provides the strong definition that overrides it.
+  // Direct call (not a self-registering init) so the symbol survives a
+  // cc_static_library archive where the linker drops unreferenced objects.
+  friend ErrorOr<DeviceRef> createNPUDevice(int id);
 
   /// Returns the vendor and compute_capability of the accelerator in the form
   /// of `vendor:compute_capability`. For example, an A100 GPU would return

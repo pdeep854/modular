@@ -72,6 +72,15 @@ static_assert(
 
 namespace M::Driver {
 
+// Weak default: "npu" is unavailable unless QuRTDeviceContext.cpp is linked in.
+// The QuRT library provides the strong definition that overrides this no-op.
+// Using a weak symbol avoids a compile-time flag: any binary that does NOT
+// include the QuRT library gets a clear "not linked" error; any binary that
+// does gets QuRT device creation for free.
+[[gnu::weak]] ErrorOr<DeviceRef> createNPUDevice(int /*id*/) {
+  return Error("NPU backend not available: QuRTDeviceContext not linked");
+}
+
 // Thread-local pointer to the currently bound device context.
 static thread_local const DeviceContext *currentlyBoundContext = nullptr;
 
@@ -405,6 +414,9 @@ MODULAR_CXX_EXPORT ErrorOr<DeviceRef> Device::create(StringRef api, int id) {
       return device.takeError();
     return DeviceRef::copy(&device.get());
   }
+
+  if (api == npuAPI)
+    return createNPUDevice(id);
 
   if (api == gpuAPI) {
     return Error(llvm::Twine("No supported \"gpu\" device available.\n") +
@@ -1893,6 +1905,13 @@ MODULAR_CXX_EXPORT int Device::numberOfDevices(StringRef api) {
     ErrorOr<CpuDevice &> device = CpuDevice::get(0);
     if (!device.isError())
       return device->deviceCount();
+  }
+
+  if (api == npuAPI) {
+    // Delegate to the statically-linked QuRT NPU backend for device count.
+    ErrorOr<DeviceRef> dev = createNPUDevice(0);
+    if (!dev.isError())
+      return static_cast<int>((*dev)->deviceCount());
   }
 
   return 0;

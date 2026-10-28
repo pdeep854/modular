@@ -1,0 +1,457 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The manifest-gate falsifier in examples/hexagon-ondevice synthesises skewed
+# copies of the dispatch ABI manifest from the real file, and the device half of
+# the queue transport is built against the same frame layout as the host half.
+exports_files([
+    "NPUDspQueueABI.h",
+    "NPUKernels.def",
+    "NPUQueueWire.h",
+    # The def/host parity gate reads the host packer TU for the slot ceiling
+    # and the selector law, the way the def/C gate reads mojo_npu_imp.c.
+    "QuRTDeviceContext.cpp",
+])
+
+# The on-device NPU backend, reached over FastRPC.
+#
+# Unlike the discrete accelerator's driver plugin this is linked statically
+# rather than loaded through MODULAR_DRIVER_PLUGINS: the plugin seam hands back
+# a `M::Driver::Device *` the plugin itself constructed, which needs MLRT's C++
+# base classes resolved when the plugin loads. That works on a POSIX host via
+# RTLD_GLOBAL; a Windows host has no lazy cross-image binding, so the backend is
+# linked into the same image and `Device::create` calls `createNPUDevice`
+# directly. It has to be a direct call: a self-registering initializer does not
+# survive the `cc_static_library` that stages this for Windows, which flattens
+# the closure into a plain archive where the linker drops any object no symbol
+# refers to -- past that point `alwayslink` no longer protects it.
+cc_library(
+    name = "QuRTDeviceContext",
+    srcs = [
+        "NPUDispatchRecorder.cpp",
+        "NPUQueueTransport.cpp",
+        "QuRTDeviceContext.cpp",
+        "QuRTDriver.cpp",
+    ],
+    hdrs = [
+        "NPUDispatchRecorder.h",
+        "NPUDspQueueABI.h",
+        "NPUQueueTransport.h",
+        "QuRTDeviceContext.h",
+        "QuRTDriver.h",
+    ],
+    # Expanded rather than included once, and expanded again on the device side:
+    # examples/hexagon-ondevice/build.sh stages it beside the skel sources.
+    textual_hdrs = ["NPUKernels.def"],
+    deps = [
+        ":npu_constant_ranges",
+        ":npu_queue_wire",
+        "@@+llvm_configure+llvm-project//llvm:Support",
+        "@@//MLRT:Driver/DeviceContextAPI",
+        "@@//Support:Base",
+        "@@//Support:DLFcn",
+    ],
+    alwayslink = True,
+)
+
+# The loader-declared constant-range registry behind the weights-NOFLUSH
+# classification. Its own library so the provenance predicate is testable
+# without dragging in MLRT, and so the exec drivers' C calls and the backend's
+# query resolve to the one registry.
+cc_library(
+    name = "npu_constant_ranges",
+    srcs = ["npu_constant_ranges.cpp"],
+    hdrs = ["npu_constant_ranges.h"],
+    tags = ["no-mypy"],
+)
+
+# The queue frame layout and the vendor descriptor's restated ABI, so the device
+# half of the transport can be built and tested against the same headers the
+# host packs with, without dragging in MLRT.
+cc_library(
+    name = "npu_queue_wire",
+    hdrs = [
+        "NPUDspQueueABI.h",
+        "NPUQueueWire.h",
+    ],
+    includes = ["."],
+    tags = ["no-mypy"],
+)
+
+# The address split a launch sends for each buffer operand: the allocation the
+# device maps, and the offset it adds back. Arithmetic over the allocation map,
+# so it needs neither FastRPC nor a device and runs on any host.
+cc_test(
+    name = "npu_launch_offsets_test",
+    srcs = ["npu_launch_offsets_test.cpp"],
+    tags = ["no-mypy"],
+)
+
+# The weights-NOFLUSH provenance predicate through the same C seam the backend
+# queries: declared ranges cover, everything else refuses. Pure interval
+# arithmetic, no FastRPC, no device.
+cc_test(
+    name = "npu_constant_ranges_test",
+    srcs = ["npu_constant_ranges_test.cpp"],
+    tags = ["no-mypy"],
+    deps = [":npu_constant_ranges"],
+)
+
+# A stand-in for the vendor FastRPC library, bound through the
+# MODULAR_NPU_TRANSPORT_LIB seam. Test-only: it re-decodes the generic entry
+# point's wire layout and writes a deterministic pattern where a kernel would
+# write, so the dispatch path (and its recorder) can run on a host with no NPU.
+cc_binary(
+    name = "npu_fake_transport",
+    testonly = True,
+    srcs = ["npu_fake_transport.c"],
+    linkshared = True,
+)
+
+# The same stand-in with remote_handle64_control compiled out, so the power
+# vote's missing-symbol report is tested against a genuinely absent dlsym
+# rather than a stub that answers differently.
+cc_binary(
+    name = "npu_fake_transport_no_control",
+    testonly = True,
+    srcs = ["npu_fake_transport.c"],
+    linkshared = True,
+    local_defines = ["NPU_FAKE_NO_CONTROL=1"],
+)
+
+# The per-dispatch IO recorder, driven through the real launch path against the
+# stand-in transport: every dispatch captured in order, operand tuples as
+# packed, hashes stable within and across processes, and — the control — a
+# recorded run's buffer bytes identical to an unrecorded run's.
+# The perf timeline, driven through the real launch path against a stand-in
+# transport that blocks for a known time and reports a known device figure: the
+# spans have to put injected time back where it was spent, above all the gap
+# BETWEEN launches, which on this transport is device idle. The control is that
+# the same chain with the timeline off writes nothing.
+cc_test(
+    name = "npu_perf_timeline_test",
+    srcs = ["npu_perf_timeline_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# Batched dispatch, judged as a differential: the same chain of launches down
+# the per-call path and down the batched path has to leave identical bytes, with
+# a deliberately altered launch as the control that the comparison can fail.
+cc_test(
+    name = "npu_batched_dispatch_test",
+    srcs = ["npu_batched_dispatch_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# What a per-launch scratch buffer costs a batch: allocations counted at the one
+# chokepoint they all pass through (the stand-in's rpcmem_alloc), and the mean
+# batch width that follows, per-launch witness against process-lifetime.
+cc_test(
+    name = "npu_witness_alloc_count_test",
+    srcs = ["npu_witness_alloc_count_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The witness arena: one slot per in-flight launch out of one process-lifetime
+# allocation, and the guards deferred to the flush that reads them. Each gate
+# runs twice -- once as itself and once against the mutation it exists to
+# catch (one shared slot, no guard armed, an attribution guard promoted).
+cc_test(
+    name = "npu_witness_arena_test",
+    srcs = ["npu_witness_arena_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# What `loadFunction` can and cannot see: an appended row loads against a
+# stand-in that refuses its selector, a name no manifest carries is still
+# refused, and the invoke is where the two tables disagree -- with the cleared
+# refusal as the control the leg can fail on.
+cc_test(
+    name = "npu_selector_refusal_test",
+    srcs = ["npu_selector_refusal_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The queue channel's buffer mapping, held to the mode silicon accepts: the
+# stand-in transport models the vendor's fd-keyed bookkeeping (populated only
+# by FASTRPC_MAP_FD), the queue leg must complete through the real channel,
+# and the static-world control must be refused with ENOSUCHMAP named -- order
+# 081's presentation, reproduced host-side.
+cc_test(
+    name = "npu_queue_mapfd_test",
+    srcs = ["npu_queue_mapfd_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# NPU_STEP_ALLOC_POOL at the seam it moves: a freed chunk parks by exact size
+# and re-issues address-stable instead of dying by rpcmem_free, so the vendor
+# driver's byte-proportional first-presentation charge is paid once per
+# process instead of once per step. Judged at the stand-in's own rpcmem
+# counters: flag off (cold AND with a warm pool) is the raw path verbatim,
+# reuse is same-address with no raw calls, buckets are exact-size, a pooled
+# block dispatches byte-identically, and parking runs chunkFree's erasures
+# verbatim (proven at the MAP_ONCE seam: park unmaps, reuse re-maps afresh).
+cc_test(
+    name = "npu_step_pool_test",
+    srcs = ["npu_step_pool_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        # Parking is per chunk, so the test must see the exact chunk it asked
+        # for, not a pooled arena above the seam being tested.
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# MODULAR_NPU_MAP_ONCE at the seam it moves: one mapping per allocation for
+# its whole life instead of one per call, in the only mode the vendor's
+# fd-keyed bookkeeping accepts, with the flag-off arm as the in-binary negative
+# control and the free/realloc lifecycle leg that catches a mapping outliving
+# its buffer. Every leg runs three rounds: both hazards present intermittently.
+cc_test(
+    name = "npu_map_once_test",
+    srcs = ["npu_map_once_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        # Mapping is per allocation, so the test must see the exact chunk it
+        # asked for, not a pooled arena.
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The step table (megastep), judged as the batch is: a differential. The same
+# chain down the per-call path and down the tabled path has to leave identical
+# bytes — across more distinct allocations than the eight slots can union,
+# named by session-table references — with a deliberately altered launch as
+# the control, an old-transport refusal leg, and the MEGASTEP x BATCH /
+# MEGASTEP x QUEUE named refusals pinned.
+cc_test(
+    name = "npu_megastep_dispatch_test",
+    srcs = ["npu_megastep_dispatch_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        # Classification is per allocation, so the test must see the exact
+        # chunk it asked for, not a pooled arena.
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        ":npu_constant_ranges",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The megastep session table over time: registered once and trusted on the
+# identical next step, re-registered after a whole rewrite and after a
+# free-then-reallocate (the forget hook), the step SPLIT when the mutable
+# union passes the eight slots (bytes still per-call-identical), and the
+# megastep's timeline records landing inside the serve exe's step_<tag>
+# perf-mark brackets so the A/B keeps per-step attribution.
+cc_test(
+    name = "npu_megastep_lifecycle_test",
+    srcs = ["npu_megastep_lifecycle_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        ":npu_constant_ranges",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The megastep against the REAL recorded denoise step: the order-041/071
+# whole-graph step00 stream (398 launches, 185 allocations, 172 classifying
+# init-constant) distilled by npu_megastep_replay_fixture.py and driven
+# through the real table builder. Pins the one-run-plus-22-registrations
+# ledger, the provenance-matched table population, and byte-identity against
+# the per-call leg on the real selector mix and allocation pattern.
+cc_test(
+    name = "npu_megastep_replay_test",
+    srcs = ["npu_megastep_replay_test.cpp"],
+    data = [
+        "testdata/megastep_step00_fixture.txt",
+        ":npu_fake_transport",
+    ],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+        "NPU_MEGASTEP_FIXTURE": "$(rootpath testdata/megastep_step00_fixture.txt)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        ":npu_constant_ranges",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The weights-NOFLUSH classification driven through the real copy paths
+# against the stand-in transport: flag off never touches the attribute seam,
+# a whole-allocation copy from a declared range applies FORCE_NOFLUSH once,
+# any other host write withdraws it first, a free deregisters, and a refused
+# descriptor fails the copy by name instead of proceeding without the
+# attribute.
+cc_test(
+    name = "npu_weights_noflush_test",
+    srcs = ["npu_weights_noflush_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        # Classification is per allocation, so the test must see the exact
+        # chunk it asked for, not a pooled arena.
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The MODULAR_NPU_POWER session vote at its two seams: flag off leaves the
+# control seam and the invocation count exactly as they were (the pinned
+# control leg), flag on votes the host latency and dispatches power_vote once
+# each with both self-reports on stderr, and a driver without
+# remote_handle64_control is named while the DSP half proceeds.
+cc_test(
+    name = "npu_power_vote_test",
+    srcs = ["npu_power_vote_test.cpp"],
+    data = [
+        ":npu_fake_transport",
+        ":npu_fake_transport_no_control",
+    ],
+    env = {
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+        "NPU_FAKE_TRANSPORT_NO_CONTROL": "$(rootpath :npu_fake_transport_no_control)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+cc_test(
+    name = "npu_dispatch_recorder_test",
+    srcs = ["npu_dispatch_recorder_test.cpp"],
+    data = [":npu_fake_transport"],
+    env = {
+        # Chunk allocation is what hands out the arena the dispatches
+        # interior-address; the caching manager would satisfy it from a pool
+        # this test does not model.
+        "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_ONLY": "false",
+        "NPU_FAKE_TRANSPORT": "$(rootpath :npu_fake_transport)",
+    },
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+    ],
+)
+
+# The queue transport driven end to end with no device: the real packer, the
+# real drain, and a loopback where the vendor queue would be. Proves a launch
+# that travelled over the queue is byte-for-byte the launch that would have
+# travelled over the blocking invocation, that order survives both the union and
+# the ring, that a flush runs launches neither early nor never, and that the
+# drain refuses every frame it cannot trust.
+cc_test(
+    name = "npu_queue_transport_test",
+    srcs = ["npu_queue_transport_test.cpp"],
+    tags = ["no-mypy"],
+    deps = [
+        ":QuRTDeviceContext",
+        "@@//MLRT:Driver/DeviceContextImpl",
+        "@@//Support:Base",
+        "@plugin//examples/hexagon-ondevice:npu_queue_drain",
+    ],
+)
