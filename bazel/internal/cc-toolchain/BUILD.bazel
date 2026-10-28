@@ -1,7 +1,10 @@
 load("@rules_cc//cc:cc_import.bzl", "cc_import")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc/toolchains:args.bzl", "cc_args")
 load("@rules_cc//cc/toolchains:artifacts.bzl", "cc_artifact_name_pattern")
 load("@rules_cc//cc/toolchains:make_variable.bzl", "cc_make_variable")
+load("@rules_cc//cc/toolchains:tool.bzl", "cc_tool")
+load("@rules_cc//cc/toolchains:tool_map.bzl", "cc_tool_map")
 load("@rules_cc//cc/toolchains:toolchain.bzl", "cc_toolchain")
 load("@rules_cc//cc/toolchains/args:sysroot.bzl", "cc_sysroot")
 load("//bazel:config.bzl", "TOP_LEVEL_TAG")
@@ -258,6 +261,173 @@ toolchain(
     ],
     tags = [TOP_LEVEL_TAG],  # Used from MODULE.bazel
     toolchain = ":macos_clang_toolchain",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+##===----------------------------------------------------------------------===##
+# Windows ARM64 cross toolchain (llvm-mingw, UCRT ABI).
+#
+# Kept separate from the toolchain above rather than added to `PLATFORMS`: that
+# one's args and features select() on linux vs macos with no default branch, so
+# reusing them fails analysis for a windows target. Keeping the two apart also
+# guarantees this cannot perturb the Linux or macOS builds.
+##===----------------------------------------------------------------------===##
+
+cc_tool_map(
+    name = "windows-arm64_tools",
+    tags = ["manual"],
+    tools = {
+        "@rules_cc//cc/toolchains/actions:ar_actions": ":windows-arm64-llvm-ar",
+        "@rules_cc//cc/toolchains/actions:assembly_actions": ":windows-arm64-clang",
+        "@rules_cc//cc/toolchains/actions:c_compile": ":windows-arm64-clang",
+        "@rules_cc//cc/toolchains/actions:cpp_compile_actions": ":windows-arm64-clang++",
+        "@rules_cc//cc/toolchains/actions:link_actions": ":windows-arm64-clang++",
+        "@rules_cc//cc/toolchains/actions:objcopy_embed_data": ":windows-arm64-llvm-objcopy",
+        "@rules_cc//cc/toolchains/actions:strip": ":windows-arm64-llvm-strip",
+    },
+)
+
+cc_tool(
+    name = "windows-arm64-clang",
+    src = "@llvm-mingw//:bin/clang",
+    data = ["@llvm-mingw//:driver_files"],
+    tags = ["manual"],
+)
+
+cc_tool(
+    name = "windows-arm64-clang++",
+    src = "@llvm-mingw//:bin/clang++",
+    data = ["@llvm-mingw//:driver_files"],
+    tags = ["manual"],
+)
+
+cc_tool(
+    name = "windows-arm64-llvm-ar",
+    src = "@llvm-mingw//:bin/llvm-ar",
+    data = ["@llvm-mingw//:archiver_files"],
+    tags = ["manual"],
+)
+
+cc_tool(
+    name = "windows-arm64-llvm-objcopy",
+    src = "@llvm-mingw//:bin/llvm-objcopy",
+    data = ["@llvm-mingw//:objcopy_files"],
+    tags = ["manual"],
+)
+
+cc_tool(
+    name = "windows-arm64-llvm-strip",
+    src = "@llvm-mingw//:bin/llvm-strip",
+    data = ["@llvm-mingw//:objcopy_files"],
+    tags = ["manual"],
+)
+
+# The driver's default target is the linux host it runs on, so the triple has
+# to be passed explicitly. Everything else (resource dir, mingw sysroot, ld.lld)
+# it finds relative to itself, which is why those directories are allowlisted
+# here instead of going through cc_sysroot. That self-discovery is only hermetic
+# under -no-canonical-prefixes: by default the driver locates itself through
+# /proc/self/exe, which resolves bazel's symlinks into the repo download cache
+# and makes the discovered headers absolute paths the allowlist can never match.
+cc_args(
+    name = "windows-arm64_target_args",
+    actions = [
+        "@rules_cc//cc/toolchains/actions:compile_actions",
+        "@rules_cc//cc/toolchains/actions:link_actions",
+    ],
+    allowlist_include_directories = [
+        "@llvm-mingw//:mingw_include",
+        "@llvm-mingw//:resource_include",
+    ],
+    args = [
+        "--target=aarch64-w64-windows-gnu",
+        "-no-canonical-prefixes",
+    ],
+)
+
+# Support/SymbolExport.h must not emit dllimport/dllexport when everything
+# links into one static executable: dllimport on a definition in the same
+# link unit is a hard error under clang.
+cc_args(
+    name = "windows-arm64_static_export_args",
+    actions = ["@rules_cc//cc/toolchains/actions:compile_actions"],
+    args = ["-DMODULAR_NO_EXPORT"],
+)
+
+cc_args(
+    name = "windows-arm64_runtime_args",
+    actions = ["@rules_cc//cc/toolchains/actions:link_actions"],
+    args = [
+        "-fuse-ld=lld",
+        "-rtlib=compiler-rt",
+        "-unwindlib=libunwind",
+    ],
+)
+
+cc_args(
+    name = "windows-arm64_cpp_args",
+    actions = [
+        "@rules_cc//cc/toolchains/actions:cpp_compile_actions",
+        "@rules_cc//cc/toolchains/actions:link_actions",
+    ],
+    args = ["-stdlib=libc++"],
+)
+
+cc_args(
+    name = "windows-arm64_cpp_std_args",
+    actions = ["@rules_cc//cc/toolchains/actions:cpp_compile_actions"],
+    args = ["-std=c++20"],
+)
+
+cc_artifact_name_pattern(
+    name = "windows-executable-pattern",
+    category = "@rules_cc//cc/toolchains/artifacts:executable",
+    extension = ".exe",
+    prefix = "",
+)
+
+cc_artifact_name_pattern(
+    name = "windows-dynamic-library-pattern",
+    category = "@rules_cc//cc/toolchains/artifacts:dynamic_library",
+    extension = ".dll",
+    prefix = "",
+)
+
+cc_toolchain(
+    name = "windows-arm64_clang_toolchain",
+    args = [
+        ":windows-arm64_target_args",
+        ":windows-arm64_static_export_args",
+        ":windows-arm64_cpp_args",
+        ":windows-arm64_cpp_std_args",
+        ":windows-arm64_runtime_args",
+    ],
+    artifact_name_patterns = [
+        ":windows-executable-pattern",
+        ":windows-dynamic-library-pattern",
+    ],
+    compiler = "clang",
+    enabled_features = [
+        "//bazel/internal/cc-toolchain/features:archive_param_file",
+        "//bazel/internal/cc-toolchain/features:gcc_quoting_for_param_files",
+        "@rules_cc//cc/toolchains/args:experimental_replace_legacy_action_config_features",
+    ],
+    tags = [TOP_LEVEL_TAG],  # Used from MODULE.bazel
+    tool_map = ":windows-arm64_tools",
+)
+
+toolchain(
+    name = "windows-arm64-toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    tags = [TOP_LEVEL_TAG],  # Used from MODULE.bazel
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:windows",
+    ],
+    toolchain = ":windows-arm64_clang_toolchain",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 

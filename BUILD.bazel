@@ -67,6 +67,17 @@ alias(
     actual = "@mojo_gpu_toolchains//:nvidia_gpu",
 )
 
+# Cross-compilation target only: nothing executes here so unlike the other
+# platforms this is never an exec platform. Build with
+# `--platforms=//:windows-arm64-platform`.
+platform(
+    name = "windows-arm64-platform",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:windows",
+    ],
+)
+
 alias(
     name = "apple_gpu",
     actual = "@mojo_gpu_toolchains//:apple_gpu",
