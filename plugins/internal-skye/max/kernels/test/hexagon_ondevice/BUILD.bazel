@@ -1,0 +1,155 @@
+load("@@//bazel:api.bzl", "mojo_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# Host tests: the registrations are dispatch stubs, so what is testable without
+# the part is the guarding they do before a launch.
+[
+    mojo_test(
+        name = src + ".test",
+        srcs = [src],
+        deps = [
+            "//max/kernels/src/hexagon_ondevice",
+            "//stdlib/std",
+            "@@//max:extensibility",
+        ],
+    )
+    for src in [
+        "test_layer_norm_affine.mojo",
+        "test_mha_rt_selector.mojo",
+        "test_sincos_tables.mojo",
+        "test_slice_region.mojo",
+        "test_swiglu_pitched_check.mojo",
+        "test_witness_arena_guards.mojo",
+        "test_witness_arm_reader.mojo",
+    ]
+]
+
+# Host runs of the actual kernel sources the device library is built from,
+# imported from the `hexagon_ondevice` package they now live in.
+# `test_modulation.mojo` is the kernels' fp64-reference twin;
+# `test_per_channel_rows.mojo` steps the registrations' per-batch dispatch
+# offsets through the same kernels. Matching proves the algorithm and the
+# row-pitched addressing; on-device numerics still need the device gate.
+[
+    mojo_test(
+        name = src + ".test",
+        srcs = [src],
+        deps = [
+            "//max/kernels/src/hexagon_ondevice",
+            "//stdlib/std",
+            "@@//max:extensibility",
+            # The kernels and several twins address through TileTensor;
+            # `extensibility` already pulls layout in, but the import is
+            # these targets' own.
+            "@@//max:layout",
+        ],
+    )
+    for src in [
+        "test_annihilation_bench.mojo",
+        "test_attention_kernel.mojo",
+        "test_attention_masked_kernel.mojo",
+        "test_block_stack.mojo",
+        "test_conv_im2col_kernel.mojo",
+        "test_groupnorm_kernel.mojo",
+        "test_hmx_bench_selector.mojo",
+        "test_hmx_conv_act.mojo",
+        "test_hmx_crouton.mojo",
+        "test_hmx_int8.mojo",
+        "test_hmx_standalone_bench.mojo",
+        "test_layernorm_kernel.mojo",
+        "test_matmul_kernel.mojo",
+        "test_modulation.mojo",
+        "test_per_channel_rows.mojo",
+        "test_npu_rope.mojo",
+        "test_rms_norm_kernel.mojo",
+        "test_hmx_stage_protocol.mojo",
+        "test_silu_swiglu.mojo",
+        "test_softmax.mojo",
+        "test_swiglu_crouton.mojo",
+        "test_step_arena.mojo",
+        "test_step_weights.mojo",
+        "test_transpose_bias_kernel.mojo",
+    ]
+]
+
+# Flag-on twin for the cross-block activation hint: both prefetch flags on,
+# so every added call site instantiates its geometry (the host build computes
+# the addresses and no-ops the l2fetch issue). The stripe differential inside
+# the twin is the bit-identity gate — a hint may move cache lines, never data.
+mojo_test(
+    name = "test_matmul_kernel_act_xblock_pf.test",
+    srcs = ["test_matmul_kernel.mojo"],
+    copts = [
+        "-D",
+        "SKYE_HMX_ACT_PREFETCH=true",
+        "-D",
+        "SKYE_HMX_ACT_XBLOCK_PF=true",
+    ],
+    deps = [
+        "//max/kernels/src/hexagon_ondevice",
+        "//stdlib/std",
+        "@@//max:extensibility",
+        "@@//max:layout",
+    ],
+)
+
+# The Mojo megastep walker, read against the C walker's recorded behaviour
+# (P5 megakernel slice 1). The fixture blocks and the golden launch sequence
+# are produced and asserted by
+# `//examples/hexagon-ondevice:npu_megastep_walk_hosttest`; this target walks
+# the same blocks with the Mojo body and asserts the same golden, so the two
+# together are a differential and neither is the other's reference.
+mojo_test(
+    name = "test_megastep_walker.mojo.test",
+    srcs = ["test_megastep_walker.mojo"],
+    data = [
+        "//examples/hexagon-ondevice:megastep_walk_fixtures.txt",
+        "//examples/hexagon-ondevice:megastep_walk_golden.txt",
+    ],
+    env = {
+        "MEGASTEP_WALK_FIXTURES": "$(rootpath //examples/hexagon-ondevice:megastep_walk_fixtures.txt)",
+        "MEGASTEP_WALK_GOLDEN": "$(rootpath //examples/hexagon-ondevice:megastep_walk_golden.txt)",
+    },
+    deps = [
+        "//max/kernels/src/hexagon_ondevice",
+        "//stdlib/std",
+        "@@//max:extensibility",
+    ],
+)
+
+# The deferred-await twin (SKYE_HMX_WGT_DEFER_AWAIT): the same crouton suite
+# with the steady-state weight await moved after the unpack work, run against
+# the twin's deferred transport and the order-100 falsifier. A schedule-order
+# bug (await landing after consumption) reads as wrong bytes here, which is
+# exactly what the deferred transport exists to catch. Flag-off coverage is
+# the plain target above; its binary is byte-identical by comptime fold.
+mojo_test(
+    name = "test_hmx_crouton_defer_await.test",
+    srcs = ["test_hmx_crouton.mojo"],
+    copts = [
+        "-D",
+        "SKYE_HMX_WGT_DEFER_AWAIT=true",
+    ],
+    deps = [
+        "//max/kernels/src/hexagon_ondevice",
+        "//stdlib/std",
+        "@@//max:extensibility",
+        "@@//max:layout",
+    ],
+)
+
+mojo_test(
+    name = "test_matmul_kernel_defer_await.test",
+    srcs = ["test_matmul_kernel.mojo"],
+    copts = [
+        "-D",
+        "SKYE_HMX_WGT_DEFER_AWAIT=true",
+    ],
+    deps = [
+        "//max/kernels/src/hexagon_ondevice",
+        "//stdlib/std",
+        "@@//max:extensibility",
+        "@@//max:layout",
+    ],
+)

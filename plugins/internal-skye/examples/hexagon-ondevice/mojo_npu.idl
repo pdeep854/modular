@@ -1,0 +1,6 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface mojo_npu : remote_handle64 {
+   AEEResult vadd(in sequence<float> a, in sequence<float> b, rout sequence<float> c);
+};

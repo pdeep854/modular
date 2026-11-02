@@ -1,0 +1,5 @@
+package(default_visibility = ["//visibility:public"])
+
+# Expose the build file used by MODULE.bazel's http_archive for @llvm-mingw,
+# which is referenced as build_file = "//bazel/third-party:llvm-mingw.BUILD".
+exports_files(["llvm-mingw.BUILD"])

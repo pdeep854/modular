@@ -1,0 +1,14 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+# Smoke test for the windows-arm64 cross toolchain. Deliberately plain
+# `cc_binary` rather than `modular_cc_binary`: the wrapper pulls in the runtool
+# dependency and a clang-tidy test, neither of which cross-compiles.
+#
+#   ./bazelw build --platforms=//:windows-arm64-platform \
+#     //bazel/internal/cc-toolchain/tests:hello-windows
+cc_binary(
+    name = "hello-windows",
+    srcs = ["hello_windows.c"],
+    tags = ["no-mypy"],
+    target_compatible_with = ["@platforms//os:windows"],
+)

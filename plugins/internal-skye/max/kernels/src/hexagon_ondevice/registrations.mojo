@@ -20,16 +20,11 @@ and makes an ambiguity a compile error rather than a silent wrong pick.
 
 Selectors the kernel set carries but nothing here reaches yet, and why:
 
-- `vscale_offset` is the bring-up scale-and-shift sibling of `vadd`; no
-  staged op lowers to it.
-
-`vadd` left that list when `Add` below grew its device arm: under
-`MODULAR_NPU_ADD_DEVICE=1` a bare fp32 add dispatches it, and fp16/bf16 adds
-dispatch `gate_residual`'s ones-gate arm the same way. `silu` left it when
-`Silu` took over the elementwise SIMD lambda the compiler would otherwise
-register -- that lambda is device code that does not compile here, so a bare
-`silu` was a hard refusal rather than a slow path, which is what made one
-dispatch per activation the better trade.
+- `vadd` backs an op the compiler registers as an elementwise SIMD lambda for
+  its fusion machinery rather than an `execute` kernel. `silu` was in the same
+  position until `Silu` below took it over -- that lambda is device code that
+  does not compile here, so a bare `silu` was a hard refusal rather than a slow
+  path, which is what made one dispatch per activation the better trade.
 
 Four registrations here claim a `mo.composite.*` the graph compiler mints
 rather than an operator a model author wrote: `gated_residual`,
@@ -71,10 +66,9 @@ from builtin_primitives.primitives import OwnedByteBuffer
 from std.collections import Array
 from std.collections.string import atol
 from std.ffi import external_call, _get_global_or_null
-from max.gpu.host import DeviceContext, Dim
+from std.gpu.host import DeviceContext, Dim
 from std.math import min, round, sqrt
-from std.memory import AddressSpace, alloc, unsafe_memcpy
-from std.memory.alloc import unsafe_alloc
+from std.memory import alloc, unsafe_memcpy
 from std.os import getenv
 from std.utils.index import IndexList
 
@@ -108,10 +102,7 @@ from .dispatch import (
     NPU_GUARD_WORDS,
     NPU_MATMUL_PATH_HMX_RAN,
     NPU_MATMUL_PATH_UNSET,
-    NPU_RELAYOUT_PATH_RAN,
     NPU_THREAD_MASK,
-    NPU_UNPACK_ARM_BIAS,
-    NPU_UNPACK_ARM_BIAS_RESID,
     NPU_UNPACK_ARM_NATIVE,
     NPU_UNPACK_ARM_PAIRED,
     NPU_UNPACK_ARM_SCALAR_OFF,
@@ -120,21 +111,10 @@ from .dispatch import (
     NPU_UNPACK_ARM_VECTOR,
     NPU_WITNESS_BYTES,
     NPU_WITNESS_MATMUL_PATH,
-    NPU_WITNESS_RELAYOUT_PATH,
     NPU_WITNESS_UNPACK_ARM,
     npu_selector_sig,
 )
-from layout.coord import Coord
-from layout.tile_layout import row_major
-
-from .hmx_crouton import (
-    HMX_TILE,
-    HmxRows2D,
-    hmx_native_weight_croutons,
-    hmx_panel,
-    hmx_repack_weight_cpm,
-)
-from .matmul_kernel import matmul_bt_hmx_accepts, mm_conv_fused_supported
+from .matmul_kernel import mm_conv_fused_supported
 from .rms_norm_kernel import (
     RMS_ROPE_MAGIC,
     RMS_ROPE_MAX_HEAD,
@@ -292,7 +272,7 @@ def _require_pitched_rows[
 
 comptime _NPU_ARENA_KEY: StaticString = "npu_witness_arena"
 
-comptime _NPUArenaPtr = Pointer[UInt32, MutUnsafeAnyOrigin]
+comptime _NPUArenaPtr = UnsafePointer[UInt32, MutUnsafeAnyOrigin]
 
 
 def _arena_ptr(cached: Pointer[NoneType, MutUntrackedOrigin]) -> _NPUArenaPtr:
@@ -330,7 +310,7 @@ def _witness_arena(ctx: DeviceContext) raises -> _NPUArenaPtr:
         var buf = ctx.enqueue_create_buffer[DType.uint32](NPU_ARENA_BYTES)
         var fresh = buf.unsafe_ptr()
         external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(_NPU_ARENA_KEY), fresh.unsafe_bitcast[NoneType]()
+            StringSlice(_NPU_ARENA_KEY), fresh.bitcast[NoneType]()
         )
         _ = buf.take_ptr()
         cached = _get_global_or_null(_NPU_ARENA_KEY)
@@ -339,15 +319,11 @@ def _witness_arena(ctx: DeviceContext) raises -> _NPUArenaPtr:
         # complete header. The transport checks these against its own batch cap
         # and refuses a host whose arena is too small to keep one slot per
         # in-flight launch.
-        header[unsafe_offset=NPU_ARENA_HDR_SLOTS] = UInt32(NPU_ARENA_SLOTS)
-        header[unsafe_offset=NPU_ARENA_HDR_STRIDE] = UInt32(
-            NPU_ARENA_SLOT_BYTES
-        )
-        header[unsafe_offset=NPU_ARENA_HDR_WITNESS_BYTES] = UInt32(
-            NPU_WITNESS_BYTES
-        )
-        header[unsafe_offset=NPU_ARENA_HDR_CURSOR] = 0
-        header[unsafe_offset=NPU_ARENA_HDR_MAGIC] = NPU_ARENA_MAGIC
+        header[NPU_ARENA_HDR_SLOTS] = UInt32(NPU_ARENA_SLOTS)
+        header[NPU_ARENA_HDR_STRIDE] = UInt32(NPU_ARENA_SLOT_BYTES)
+        header[NPU_ARENA_HDR_WITNESS_BYTES] = UInt32(NPU_WITNESS_BYTES)
+        header[NPU_ARENA_HDR_CURSOR] = 0
+        header[NPU_ARENA_HDR_MAGIC] = NPU_ARENA_MAGIC
     return _arena_ptr(cached.unsafe_value())
 
 
@@ -476,22 +452,14 @@ def _witness_slot(ctx: DeviceContext) raises -> _NPUArenaPtr:
     _refuse_batched_graph_path(getenv("MODULAR_NPU_BATCH") == "1")
     _refuse_megastep_graph_path(getenv("MODULAR_NPU_MEGASTEP") == "1")
 
-    # The chain hold's backstop: every device launch takes a slot here before
-    # it enqueues, so a held matmul member runs ahead of whatever this launch
-    # is about to compute. The chain route's own calls are no-ops by then --
-    # it clears the pending record before it takes slots of its own.
-    _matmul_chain_flush()
-
     var arena = _witness_arena(ctx)
-    var cursor = Int(arena[unsafe_offset=NPU_ARENA_HDR_CURSOR])
-    arena[unsafe_offset=NPU_ARENA_HDR_CURSOR] = UInt32(
-        (cursor + 1) % NPU_ARENA_SLOTS
-    )
-    var slot = arena.unsafe_offset(
+    var cursor = Int(arena[NPU_ARENA_HDR_CURSOR])
+    arena[NPU_ARENA_HDR_CURSOR] = UInt32((cursor + 1) % NPU_ARENA_SLOTS)
+    var slot = arena + (
         NPU_ARENA_HEADER_BYTES // 4 + cursor * (NPU_ARENA_SLOT_BYTES // 4)
     )
     for i in range(NPU_ARENA_SLOT_BYTES // 4):
-        slot[unsafe_offset=i] = 0
+        slot[i] = 0
     return slot
 
 
@@ -501,7 +469,7 @@ def _guard_record(slot: _NPUArenaPtr) -> _NPUArenaPtr:
     Past the witness the device is given, so no kernel addresses it -- a launch
     carries the witness base and writes `NPU_WITNESS_WORDS` from there.
     """
-    return slot.unsafe_offset(NPU_WITNESS_BYTES // 4)
+    return slot + NPU_WITNESS_BYTES // 4
 
 
 def _arm_guard(
@@ -520,30 +488,28 @@ def _arm_guard(
     kernel set, and this side is only ever their reader.
     """
     var record = _guard_record(slot)
-    var index = Int(record[unsafe_offset=NPU_GUARD_HDR_COUNT])
-    record[unsafe_offset=NPU_GUARD_HDR_COUNT] = UInt32(index + 1)
-    record[unsafe_offset=NPU_GUARD_HDR_OP_LEN] = UInt32(op.byte_length())
+    var index = Int(record[NPU_GUARD_HDR_COUNT])
+    record[NPU_GUARD_HDR_COUNT] = UInt32(index + 1)
+    record[NPU_GUARD_HDR_OP_LEN] = UInt32(op.byte_length())
     var op_ptr = UInt64(Int(op.unsafe_ptr()))
-    record[unsafe_offset=NPU_GUARD_HDR_OP_PTR] = UInt32(op_ptr & 0xFFFFFFFF)
-    record[unsafe_offset=NPU_GUARD_HDR_OP_PTR + 1] = UInt32(op_ptr >> 32)
-    var entry = record.unsafe_offset(
-        (NPU_GUARD_HDR_WORDS + index * NPU_GUARD_WORDS)
-    )
-    entry[unsafe_offset=NPU_GUARD_CLASS] = guard_class
-    entry[unsafe_offset=NPU_GUARD_WORD] = UInt32(word)
-    entry[unsafe_offset=NPU_GUARD_COND_WORD] = UInt32(cond_word)
-    entry[unsafe_offset=NPU_GUARD_COND_VALUE] = cond_value
+    record[NPU_GUARD_HDR_OP_PTR] = UInt32(op_ptr & 0xFFFFFFFF)
+    record[NPU_GUARD_HDR_OP_PTR + 1] = UInt32(op_ptr >> 32)
+    var entry = record + (NPU_GUARD_HDR_WORDS + index * NPU_GUARD_WORDS)
+    entry[NPU_GUARD_CLASS] = guard_class
+    entry[NPU_GUARD_WORD] = UInt32(word)
+    entry[NPU_GUARD_COND_WORD] = UInt32(cond_word)
+    entry[NPU_GUARD_COND_VALUE] = cond_value
     # Last, and after the entry it counts: the transport reads a record only
     # once this word is present, so a partially written one is never evaluated.
-    record[unsafe_offset=NPU_GUARD_HDR_MAGIC] = NPU_GUARD_MAGIC
+    record[NPU_GUARD_HDR_MAGIC] = NPU_GUARD_MAGIC
     return entry
 
 
 def _accept(entry: _NPUArenaPtr, value: UInt32):
     """Adds one accepted code to a guard armed by `_arm_guard`."""
-    var count = Int(entry[unsafe_offset=NPU_GUARD_ACCEPT_COUNT])
-    entry[unsafe_offset=NPU_GUARD_ACCEPTS + count] = value
-    entry[unsafe_offset=NPU_GUARD_ACCEPT_COUNT] = UInt32(count + 1)
+    var count = Int(entry[NPU_GUARD_ACCEPT_COUNT])
+    entry[NPU_GUARD_ACCEPTS + count] = value
+    entry[NPU_GUARD_ACCEPT_COUNT] = UInt32(count + 1)
 
 
 def _arm_matmul_ran(slot: _NPUArenaPtr, op: StaticString):
@@ -615,8 +581,6 @@ def _arm_unpack_arm_known(slot: _NPUArenaPtr, op: StaticString):
     _accept(entry, NPU_UNPACK_ARM_SCALAR_REFUSED)
     _accept(entry, NPU_UNPACK_ARM_PAIRED)
     _accept(entry, NPU_UNPACK_ARM_NATIVE)
-    _accept(entry, NPU_UNPACK_ARM_BIAS)
-    _accept(entry, NPU_UNPACK_ARM_BIAS_RESID)
 
 
 def _require_matmul_ran(path: UInt32, op: StaticString) raises:
@@ -703,8 +667,6 @@ def _require_unpack_arm_known(
         or arm == NPU_UNPACK_ARM_SCALAR_REFUSED
         or arm == NPU_UNPACK_ARM_PAIRED
         or arm == NPU_UNPACK_ARM_NATIVE
-        or arm == NPU_UNPACK_ARM_BIAS
-        or arm == NPU_UNPACK_ARM_BIAS_RESID
     ):
         return
     raise Error(
@@ -715,606 +677,6 @@ def _require_unpack_arm_known(
         ),
         arm,
         "); see HMX_UNPACK_ARM_* in hmx_crouton.mojo for what the code names",
-    )
-
-
-def _stage_k_padded_rows[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    rows: Int,
-    k: Int,
-    k_pad: Int,
-):
-    """Stages `[rows, k]` row-major data into a `[rows, k_pad]` buffer.
-
-    Zero-padding the contraction axis is the identity on the result: every
-    padded lane pairs a zero of A with a zero of B and contributes exactly
-    nothing to the accumulation. The `matmul` selector reads K in 64-element
-    vectors, so a ragged K is dispatched at the next multiple of 64 through
-    this staging -- the same trick `mo.conv` plays on its im2col rows, and
-    the one the silicon-certified hand driver plays on `post_quant_conv`.
-
-    Args:
-        dst: The `[rows, k_pad]` destination; every element is written, so
-            the buffer needs no prior fill.
-        src: The `[rows, k]` row-major source.
-        rows: How many rows to stage.
-        k: The source row length.
-        k_pad: The destination row pitch; at least `k`.
-    """
-    for i in range(rows):
-        unsafe_memcpy(
-            dest=dst.unsafe_offset(i * k_pad),
-            src=src.unsafe_offset(i * k),
-            count=k,
-        )
-        for j in range(k, k_pad):
-            dst[unsafe_offset=i * k_pad + j] = 0
-
-
-def _stage_scaled_rows[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    rows: Int,
-    k: Int,
-    k_pad: Int,
-    scale: Float32,
-):
-    """Stages `[rows, k]` row-major data into `[rows, k_pad]`, folding `scale`.
-
-    The decomposed attention's scale fold: the signed `softmax` selector takes
-    no scale scalar, so the hand driver folds the softmax scale host-side into
-    `to_q` in fp32 (`npu_vae_decoder_dispatch.cpp`, `walkAttention`). Folding
-    into the staged activation instead is the same operator with one extra
-    `dtype` rounding: the multiply happens in fp32 and rounds once on store.
-    The zero tail is `_stage_k_padded_rows`'s contraction identity, so a
-    ragged row length dispatches at the next multiple of 64.
-
-    Args:
-        dst: The `[rows, k_pad]` destination; every element is written, so
-            the buffer needs no prior fill.
-        src: The `[rows, k]` row-major source.
-        rows: How many rows to stage.
-        k: The source row length.
-        k_pad: The destination row pitch; at least `k`.
-        scale: The factor folded into every staged element.
-    """
-    for i in range(rows):
-        for j in range(k):
-            dst[unsafe_offset=i * k_pad + j] = (
-                src[unsafe_offset=i * k + j].cast[DType.float32]() * scale
-            ).cast[dtype]()
-        for j in range(k, k_pad):
-            dst[unsafe_offset=i * k_pad + j] = 0
-
-
-def _stage_transposed_rows[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    rows: Int,
-    cols: Int,
-    rows_pad: Int,
-):
-    """Stages `[rows, cols]` row-major data transposed into `[cols, rows_pad]`.
-
-    The hand driver's `transposeStrided`: V arrives token-major `[seq, dim]`
-    and the PV matmul contracts over the sequence, so V becomes the
-    `[N=dim, K=seq]` b-transposed weight the `matmul` selector reads. The
-    zeroed tail carries the same contraction identity as
-    `_stage_k_padded_rows` -- a ragged sequence pairs zero probability
-    columns with these zero columns and adds exactly nothing.
-
-    Args:
-        dst: The `[cols, rows_pad]` destination; every element is written, so
-            the buffer needs no prior fill.
-        src: The `[rows, cols]` row-major source.
-        rows: The source row count, the destination's inner extent.
-        cols: The source row length, the destination's row count.
-        rows_pad: The destination row pitch; at least `rows`.
-    """
-    for c in range(cols):
-        for r in range(rows):
-            dst[unsafe_offset=c * rows_pad + r] = src[
-                unsafe_offset=r * cols + c
-            ]
-        for r in range(rows, rows_pad):
-            dst[unsafe_offset=c * rows_pad + r] = 0
-
-
-comptime _WEIGHT_NATIVE_ENV = "MODULAR_NPU_WEIGHT_NATIVE"
-
-
-def _stage_native_weight(m: Int, n: Int, k_pad: Int) -> Bool:
-    """Whether a staged B operand must carry the crouton byte order.
-
-    The `matmul` selector's weight layout is a skel build define
-    (`SKYE_HMX_WEIGHTS_NATIVE`) no host code can read, so the serve declares
-    it through the environment: strictly "1", the same reading
-    `npu_registry_load.h` gives the same variable, and any other value keeps
-    the row-major staging every non-native world reads. The shape half
-    mirrors the kernel's own arm gate -- a dispatch the array refuses runs
-    the row-major HVX nest, and croutons staged for that nest would be the
-    same silent mismatch this predicate exists to remove. Read per dispatch:
-    a `getenv` beside a transport that costs a second is free, and one MEF
-    outlives any single serve's environment.
-
-    Args:
-        m: Output rows of the dispatch.
-        n: Output columns, the staged operand's row count.
-        k_pad: The reduction extent as dispatched; a multiple of 64.
-
-    Returns:
-        True when the staged rows must be repacked into croutons.
-    """
-    if getenv(_WEIGHT_NATIVE_ENV) != "1":
-        return False
-    return matmul_bt_hmx_accepts(m, n, k_pad, 0, n)
-
-
-comptime _CONV_HMX_ENV = "MODULAR_NPU_CONV_HMX"
-
-
-def _conv_hmx_requested() -> Bool:
-    """Whether the fused conv dispatches the array selector instead of HVX.
-
-    Read per dispatch for the same reason `_stage_native_weight` reads its
-    variable there: one MEF outlives any single serve's environment. ON is
-    the shipped posture -- the array arm certified at orders 319/320
-    (byte-tier control, census 31+1, twin x4 boots, wall -22.9%); an
-    explicit "0" restores selector 36, keeping the one-variable A/B and the
-    certified fallback reachable on any serve without a re-mint.
-    """
-    return getenv(_CONV_HMX_ENV) != "0"
-
-
-def _crouton_pack_rows[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    n: Int,
-    k: Int,
-):
-    """Repacks row-major `[n, k]` rows into the column-panel-major artefact.
-
-    The kernels' own `hmx_repack_weight_cpm` -- the crouton order's one
-    implementation in the tree -- over the same re-origination seam its read
-    side (`hmx_native_weight_panel`) makes. Same element count in and out;
-    only the meaning of the byte order changes, which is why the caller
-    gates on `_stage_native_weight` rather than anything here being able to
-    check.
-
-    Args:
-        dst: The `[n, k]` destination; receives every element, crouton-ordered.
-        src: The `[n, k]` row-major source.
-        n: Output columns of the matmul this weight serves; a multiple of 32.
-        k: The reduction extent; a multiple of 64.
-    """
-    comptime assert (
-        dtype == DType.float16
-    ), "the crouton weight artefact is the fp16 arm's"
-    hmx_repack_weight_cpm[AddressSpace.GENERIC](
-        hmx_panel[AddressSpace.GENERIC](
-            Pointer[Scalar[DType.float16], MutUntrackedOrigin](
-                unsafe_from_address=Int(dst)
-            ),
-            hmx_native_weight_croutons(n, k),
-        ),
-        HmxRows2D(
-            ptr=Pointer[Scalar[DType.float16], MutUnsafeAnyOrigin](
-                unsafe_from_address=Int(src)
-            ),
-            layout=row_major(Coord(n, k)),
-        ),
-        n,
-        k,
-    )
-
-
-def _stage_weight_rows[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    rows: Int,
-    k: Int,
-    k_pad: Int,
-    m: Int,
-):
-    """Stages `[rows, k]` row-major B into `[rows, k_pad]`, layout-matched.
-
-    `_stage_k_padded_rows` with the layout question answered: on an
-    array-native serve (`_stage_native_weight`) the staged rows additionally
-    take the crouton byte order the skel's feeders read, because selector 24
-    has no runtime layout arm -- a row-major B on a native skel computes
-    finite, well-scaled, entirely wrong numbers (the 306 a2/a3 conviction).
-    Zero-padding first keeps the contraction identity; the pad rides into
-    the croutons like any other zero element.
-
-    Args:
-        dst: The `[rows, k_pad]` destination; every element is written.
-        src: The `[rows, k]` row-major source.
-        rows: How many rows to stage (the matmul's N).
-        k: The source row length.
-        k_pad: The destination row pitch; at least `k`, a multiple of 64.
-        m: Output rows of the dispatch this operand feeds.
-    """
-    if not _stage_native_weight(m, rows, k_pad):
-        _stage_k_padded_rows(dst, src, rows, k, k_pad)
-        return
-    if k == k_pad:
-        _crouton_pack_rows(dst, src, rows, k_pad)
-        return
-    var staged = unsafe_alloc[Scalar[dtype]](rows * k_pad)
-    _stage_k_padded_rows(staged, src, rows, k, k_pad)
-    _crouton_pack_rows(dst, staged, rows, k_pad)
-    staged.unsafe_free()
-
-
-def _stage_transposed_weight[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    rows: Int,
-    cols: Int,
-    rows_pad: Int,
-    m: Int,
-):
-    """`_stage_transposed_rows` with the layout question answered.
-
-    The decomposed attention's V^T is a runtime-built `[N = cols,
-    K = rows_pad]` weight operand, so it owes the serving skel the same
-    layout `_stage_weight_rows` owes for a registry row -- the crouton
-    contract binds every B the selector reads, not only checkpoint weights.
-
-    Args:
-        dst: The `[cols, rows_pad]` destination; every element is written.
-        src: The `[rows, cols]` row-major source.
-        rows: The source row count, the destination's inner extent.
-        cols: The source row length, the destination's row count.
-        rows_pad: The destination row pitch; at least `rows`.
-        m: Output rows of the dispatch this operand feeds.
-    """
-    if not _stage_native_weight(m, cols, rows_pad):
-        _stage_transposed_rows(dst, src, rows, cols, rows_pad)
-        return
-    var staged = unsafe_alloc[Scalar[dtype]](cols * rows_pad)
-    _stage_transposed_rows(staged, src, rows, cols, rows_pad)
-    _crouton_pack_rows(dst, staged, cols, rows_pad)
-    staged.unsafe_free()
-
-
-comptime _MATMUL_CHAIN_ENV = "MODULAR_NPU_MATMUL_CHAIN"
-
-comptime _CHAIN_STATE_KEY: StaticString = "npu_matmul_chain_pending"
-
-comptime _CHAIN_WORDS = 12
-"""live flag, then c/a/b/witness addresses (two words each), then m, n, k."""
-
-comptime _CHAIN_TAKE_CLAIMED: UInt32 = 1
-comptime _CHAIN_TAKE_FIRED: UInt32 = 2
-
-
-def _matmul_chain_requested() -> Bool:
-    """Whether adjacent independent matmuls pair into `matmul_chain2` (48).
-
-    Strictly "1", read per dispatch, unset the shipping default -- the
-    `_add_device_requested` contract. Valid only against a catalogue whose
-    skel carries selector 48; an older signed skel refuses the row by name
-    and the caller keeps selector 24 singletons.
-    """
-    return getenv(_MATMUL_CHAIN_ENV) == "1"
-
-
-def _refuse_chain_with_queue(chain: Bool, queue: Bool) raises:
-    """Refuses the chain hold under `MODULAR_NPU_QUEUE=1`.
-
-    The hold's soundness argument is the synchronous transport's: a held
-    member is dispatched before any seam through which its output can be
-    observed, and `dispatchSingle` completes before it returns. The queue
-    makes the second half untrue -- a fired member is merely ENQUEUED -- so
-    the pair of knobs is refused by value, the batch-refusal shape, rather
-    than reasoned about per site.
-    """
-    if not (chain and queue):
-        return
-    raise Error(
-        "MODULAR_NPU_MATMUL_CHAIN=1 is refused with MODULAR_NPU_QUEUE=1: the"
-        " chain hold's flush discipline assumes the blocking transport, where"
-        " a fired member has RUN when the fire returns. Unset one of the two."
-    )
-
-
-def _chain_state_or_null() -> Optional[Pointer[NoneType, MutUntrackedOrigin]]:
-    return _get_global_or_null(_CHAIN_STATE_KEY)
-
-
-def _chain_state(ctx: DeviceContext) raises -> _NPUArenaPtr:
-    """The one pending-member record: the witness arena's own global idiom."""
-    var cached = _chain_state_or_null()
-    if not cached:
-        var buf = ctx.enqueue_create_buffer[DType.uint32](_CHAIN_WORDS)
-        var fresh = buf.unsafe_ptr()
-        for i in range(_CHAIN_WORDS):
-            fresh[unsafe_offset=i] = 0
-        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(_CHAIN_STATE_KEY), fresh.unsafe_bitcast[NoneType]()
-        )
-        _ = buf.take_ptr()
-        cached = _chain_state_or_null()
-    return _arena_ptr(cached.unsafe_value())
-
-
-def _chain_addr_store(state: _NPUArenaPtr, word: Int, addr: Int):
-    state[unsafe_offset=word] = UInt32(addr & 0xFFFFFFFF)
-    state[unsafe_offset=word + 1] = UInt32((addr >> 32) & 0xFFFFFFFF)
-
-
-def _chain_addr_load(state: _NPUArenaPtr, word: Int) -> Int:
-    return Int(state[unsafe_offset=word]) | (
-        Int(state[unsafe_offset=word + 1]) << 32
-    )
-
-
-def _matmul_chain_flush():
-    """Fires a held chain member, if any. The 186A closure, stub half.
-
-    Called at the top of EVERY registration in this file before it touches
-    an operand -- host walks included, which is exactly the reader class
-    that corrupts a held batch (`_refuse_batched_graph_path`) -- and needs
-    no context: the held launch lives fully packed on the transport side,
-    and `npuChainFire` runs it through `dispatchSingle`. The transport also
-    fires it itself at every `flushBatch` seam (copies, synchronize, alloc,
-    free, teardown), which is what closes the window a graph's LAST
-    registration would otherwise leave open.
-    """
-    var cached = _chain_state_or_null()
-    if not cached:
-        return
-    var state = _arena_ptr(cached.unsafe_value())
-    if state[unsafe_offset=0] == 0:
-        return
-    state[unsafe_offset=0] = 0
-    _ = external_call["npuChainFire", UInt32]()
-
-
-comptime _ChainGemvPtr = Pointer[Scalar[DType.float16], MutUnsafeAnyOrigin]
-
-
-def _chain_dense_2d(shape: IndexList[2], strides: IndexList[2]) -> Bool:
-    """Whether a rank-2 view is dense row-major, without raising.
-
-    The independence proof below is byte-range arithmetic over
-    `base + rows * cols * 2`, which is only the tensor's true extent when
-    the view is dense; anything else declines the chain and keeps the
-    incumbent path.
-    """
-    return strides[1] == 1 and strides[0] == shape[1]
-
-
-def _matmul_chain2_independent(
-    c0: Int,
-    c0_bytes: Int,
-    a0: Int,
-    a0_bytes: Int,
-    b0: Int,
-    b0_bytes: Int,
-    c1: Int,
-    c1_bytes: Int,
-    a1: Int,
-    a1_bytes: Int,
-    b1: Int,
-    b1_bytes: Int,
-) -> Bool:
-    """Whether two adjacent matmuls are provably independent, by byte range.
-
-    The proof the grouper needs is exactly the scoping's dependency analysis
-    (`MATMUL_CHAIN_SCOPING.md` section 2, read off `block_stack.mojo`'s
-    block programs): two neighbors chain only when NEITHER reads or writes
-    the other's output. In dispatch-time terms, over dense fp16 extents:
-
-    - RAW: member 1's `A` or `B` overlaps member 0's `C` -- refused.
-    - WAR: member 1's `C` overlaps member 0's `A` or `B` -- refused (the
-      members share one launch, so both orders are hazards).
-    - WAW: the two `C` ranges overlap -- refused.
-
-    Shared INPUTS (`A0 == A1`, the encoder q/k/v shape) overlap freely.
-    Anything not provable from the pointers and extents in hand is a
-    refusal, never an assumption -- order 280's conservation law is held by
-    refusing the pair, not by reordering around it.
-    """
-
-    def overlaps(lo0: Int, len0: Int, lo1: Int, len1: Int) -> Bool:
-        return lo0 < lo1 + len1 and lo1 < lo0 + len0
-
-    if overlaps(c0, c0_bytes, a1, a1_bytes):
-        return False
-    if overlaps(c0, c0_bytes, b1, b1_bytes):
-        return False
-    if overlaps(c1, c1_bytes, a0, a0_bytes):
-        return False
-    if overlaps(c1, c1_bytes, b0, b0_bytes):
-        return False
-    if overlaps(c0, c0_bytes, c1, c1_bytes):
-        return False
-    return True
-
-
-def _matmul_chain2_eligible(m: Int, n: Int, k: Int) -> Bool:
-    """Whether one member is chain-eligible: the DEVICE's own array predicate.
-
-    `matmul_bt_hmx_accepts` is imported rather than mirrored so the two
-    sides cannot drift; a member that passes here and still declines on the
-    device (a non-HMX skel) falls to the chain kernel's nest arm for BOTH
-    members -- correct, never mixed. M=1 gemvs and every other
-    predicate-declined shape stay selector-24 singletons this batch.
-    """
-    return matmul_bt_hmx_accepts(m, n, k, 0, n)
-
-
-def _matmul_chain_route(
-    ctx: DeviceContext,
-    c_ptr: Int,
-    a_ptr: Int,
-    b_ptr: Int,
-    m: Int,
-    n: Int,
-    k: Int,
-    dense: Bool,
-) raises -> Bool:
-    """Routes one matmul dispatch through the chain grouper.
-
-    True: the dispatch was consumed (deferred as a pending member, or paired
-    with the held one into a `matmul_chain2` launch). False: the caller owns
-    the dispatch, and any previously held member has been flushed ahead of
-    it -- singletons fall through to selector 24 unchanged.
-    """
-    var chain_on = _matmul_chain_requested()
-    var cached = _chain_state_or_null()
-    if not cached and not chain_on:
-        return False
-    _refuse_chain_with_queue(chain_on, getenv("MODULAR_NPU_QUEUE") == "1")
-
-    var state = _chain_state(ctx)
-    var incoming_ok = (
-        chain_on and dense and _matmul_chain2_eligible(m, n, k)
-    )
-
-    if state[unsafe_offset=0] != 0:
-        var c0 = _chain_addr_load(state, 1)
-        var a0 = _chain_addr_load(state, 3)
-        var b0 = _chain_addr_load(state, 5)
-        var m0 = Int(state[unsafe_offset=9])
-        var n0 = Int(state[unsafe_offset=10])
-        var k0 = Int(state[unsafe_offset=11])
-        if incoming_ok and _matmul_chain2_independent(
-            c0,
-            m0 * n0 * 2,
-            a0,
-            m0 * k0 * 2,
-            b0,
-            n0 * k0 * 2,
-            c_ptr,
-            m * n * 2,
-            a_ptr,
-            m * k * 2,
-            b_ptr,
-            n * k * 2,
-        ):
-            state[unsafe_offset=0] = 0
-            var take = external_call["npuChainTakeHeld", UInt32]()
-            if take == _CHAIN_TAKE_CLAIMED:
-                var slot0 = _NPUArenaPtr(
-                    unsafe_from_address=_chain_addr_load(state, 7)
-                )
-                _matmul_chain2_dispatch(
-                    ctx,
-                    c0,
-                    a0,
-                    b0,
-                    slot0,
-                    c_ptr,
-                    a_ptr,
-                    b_ptr,
-                    m0,
-                    n0,
-                    k0,
-                    m,
-                    n,
-                    k,
-                )
-                return True
-            # FIRED: a flush seam ran the held member already; the incoming
-            # matmul starts a fresh hold below. Any other answer is a
-            # stub/transport skew, resolved the same conservative way.
-        else:
-            _matmul_chain_flush()
-
-    if not incoming_ok:
-        return False
-
-    var slot = _witness_slot(ctx)
-    _arm_matmul_ran(slot, "mo.matmul.chain0")
-    _arm_unpack_arm_known(slot, "mo.matmul.chain0")
-    var f = ctx.load_function[npu_selector_sig](
-        function_name=String("matmul"), asm=String("")
-    )
-    state[unsafe_offset=0] = 1
-    _chain_addr_store(state, 1, c_ptr)
-    _chain_addr_store(state, 3, a_ptr)
-    _chain_addr_store(state, 5, b_ptr)
-    _chain_addr_store(state, 7, Int(slot))
-    state[unsafe_offset=9] = UInt32(m)
-    state[unsafe_offset=10] = UInt32(n)
-    state[unsafe_offset=11] = UInt32(k)
-    external_call["npuChainHoldNext", NoneType]()
-    ctx.enqueue_function(
-        f,
-        _ChainGemvPtr(unsafe_from_address=c_ptr),
-        _ChainGemvPtr(unsafe_from_address=a_ptr),
-        _ChainGemvPtr(unsafe_from_address=b_ptr),
-        slot,
-        Int32(m),
-        Int32(n),
-        Int32(k),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
-    )
-    return True
-
-
-def _matmul_chain2_dispatch(
-    ctx: DeviceContext,
-    c0: Int,
-    a0: Int,
-    b0: Int,
-    slot0: _NPUArenaPtr,
-    c1: Int,
-    a1: Int,
-    b1: Int,
-    m0: Int,
-    n0: Int,
-    k0: Int,
-    m1: Int,
-    n1: Int,
-    k1: Int,
-) raises:
-    """One `matmul_chain2` launch: the claimed member 0 plus the incoming
-    member 1, each with its own armed arena slot. The member-distinct op
-    names are the attribution: the transport's fail-fast error carries the
-    guard record's own op string, so a mid-chain failure names its member.
-    """
-    var slot1 = _witness_slot(ctx)
-    _arm_matmul_ran(slot1, "mo.matmul.chain1")
-    _arm_unpack_arm_known(slot1, "mo.matmul.chain1")
-    var f = ctx.load_function[npu_selector_sig](
-        function_name=String("matmul_chain2"), asm=String("")
-    )
-    ctx.enqueue_function(
-        f,
-        _ChainGemvPtr(unsafe_from_address=c0),
-        _ChainGemvPtr(unsafe_from_address=a0),
-        _ChainGemvPtr(unsafe_from_address=b0),
-        slot0,
-        _ChainGemvPtr(unsafe_from_address=c1),
-        _ChainGemvPtr(unsafe_from_address=a1),
-        _ChainGemvPtr(unsafe_from_address=b1),
-        slot1,
-        Int32(m0),
-        Int32(n0),
-        Int32(k0),
-        Int32(m1),
-        Int32(n1),
-        Int32(k1),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
     )
 
 
@@ -1368,55 +730,14 @@ struct Matmul:
         var m = Int(a.dim_size(0))
         var k = Int(a.dim_size(1))
         var n = Int(c.dim_size(1))
-        # Ahead of the k-pad staging below, which READS `a` and `b` on the
-        # host: the route either consumes this dispatch (deferred or paired)
-        # or has flushed any held member before the first operand read.
-        if _matmul_chain_route(
-            ctx,
-            Int(c.unsafe_ptr()),
-            Int(a.unsafe_ptr()),
-            Int(b.unsafe_ptr()),
-            m,
-            n,
-            k,
-            _chain_dense_2d(c.shape(), c.strides())
-            and _chain_dense_2d(a.shape(), a.strides())
-            and _chain_dense_2d(b.shape(), b.strides()),
-        ):
-            return
         if k % 64 != 0:
-            _require_dense(a.shape(), a.strides(), "mo.matmul", "A")
-            _require_dense(b.shape(), b.strides(), "mo.matmul", "B")
-            var k_pad = ((k + 63) // 64) * 64
-            var a_padded = ctx.enqueue_create_buffer[c.dtype](m * k_pad)
-            var b_padded = ctx.enqueue_create_buffer[c.dtype](n * k_pad)
-            _stage_k_padded_rows(
-                a_padded.unsafe_ptr(), a.unsafe_ptr(), m, k, k_pad
+            raise Error(
+                (
+                    "mo.matmul on the on-device NPU: K must be a multiple of"
+                    " 64, got "
+                ),
+                k,
             )
-            _stage_weight_rows(
-                b_padded.unsafe_ptr(), b.unsafe_ptr(), n, k, k_pad, m
-            )
-            var f_pad = ctx.load_function[npu_selector_sig](
-                function_name=String("matmul"), asm=String("")
-            )
-            var pad_witness = _witness_slot(ctx)
-            _arm_matmul_ran(pad_witness, "mo.matmul")
-            _arm_unpack_arm_known(pad_witness, "mo.matmul")
-            ctx.enqueue_function(
-                f_pad,
-                c.unsafe_ptr(),
-                a_padded.unsafe_ptr(),
-                b_padded.unsafe_ptr(),
-                pad_witness,
-                Int32(m),
-                Int32(n),
-                Int32(k_pad),
-                grid_dim=Dim(NPU_GRID_CORES),
-                block_dim=Dim(NPU_THREAD_MASK),
-            )
-            _ = a_padded^
-            _ = b_padded^
-            return
 
         var f = ctx.load_function[npu_selector_sig](
             function_name=String("matmul"), asm=String("")
@@ -1520,6 +841,15 @@ struct BatchMatmul:
                 " by ",
                 n,
             )
+        if k % 64 != 0:
+            raise Error(
+                (
+                    "mo.batch_matmul on the on-device NPU: K must be a multiple"
+                    " of 64, got "
+                ),
+                k,
+            )
+
         # The op admits batch extents that broadcast against each other, while
         # the slice arithmetic below steps all three operands by the same index.
         # An operand carrying one batch where another carries several would be
@@ -1555,76 +885,10 @@ struct BatchMatmul:
         var b_ptr = b.unsafe_ptr()
         var c_ptr = c.unsafe_ptr()
 
-        if k % 64 != 0:
-            # The staging below READS `a` and `b` on the host; a held chain
-            # member must run first. (`enqueue_create_buffer` also flushes
-            # through the transport seam, but the read is what binds.)
-            _matmul_chain_flush()
-            var k_pad = ((k + 63) // 64) * 64
-            var a_padded = ctx.enqueue_create_buffer[c.dtype](
-                num_batches * m * k_pad
-            )
-            var b_padded = ctx.enqueue_create_buffer[c.dtype](
-                num_batches * n * k_pad
-            )
-            _stage_k_padded_rows(
-                a_padded.unsafe_ptr(), a_ptr, num_batches * m, k, k_pad
-            )
-            # Per slice, not over `num_batches * n` rows at once: the crouton
-            # artefact is column-panel-major within ONE `[n, k_pad]` operand,
-            # so each slice is its own repack even though the row-major
-            # staging would have been a single pass.
-            for i in range(num_batches):
-                _stage_weight_rows(
-                    b_padded.unsafe_ptr().unsafe_offset(i * n * k_pad),
-                    b_ptr.unsafe_offset(i * b_slice),
-                    n,
-                    k,
-                    k_pad,
-                    m,
-                )
-            var f_pad = ctx.load_function[npu_selector_sig](
-                function_name=String("matmul"), asm=String("")
-            )
-            for i in range(num_batches):
-                var pad_witness = _witness_slot(ctx)
-                _arm_matmul_ran(pad_witness, "mo.batch_matmul")
-                _arm_unpack_arm_known(pad_witness, "mo.batch_matmul")
-                ctx.enqueue_function(
-                    f_pad,
-                    c_ptr.unsafe_offset(i * c_slice),
-                    a_padded.unsafe_ptr().unsafe_offset(i * m * k_pad),
-                    b_padded.unsafe_ptr().unsafe_offset(i * n * k_pad),
-                    pad_witness,
-                    Int32(m),
-                    Int32(n),
-                    Int32(k_pad),
-                    grid_dim=Dim(NPU_GRID_CORES),
-                    block_dim=Dim(NPU_THREAD_MASK),
-                )
-            _ = a_padded^
-            _ = b_padded^
-            return
-
         var f = ctx.load_function[npu_selector_sig](
             function_name=String("matmul"), asm=String("")
         )
         for i in range(num_batches):
-            # Adjacent slices of one batch_matmul are independent by
-            # construction (disjoint slices of dense operands), so the route
-            # pairs them exactly as it pairs adjacent ops; at the production
-            # leading extent of 1 this is the cross-op path.
-            if _matmul_chain_route(
-                ctx,
-                Int(c_ptr.unsafe_offset(i * c_slice)),
-                Int(a_ptr.unsafe_offset(i * a_slice)),
-                Int(b_ptr.unsafe_offset(i * b_slice)),
-                m,
-                n,
-                k,
-                True,
-            ):
-                continue
             # A SLOT PER SLICE, not one witness across them. The old comment
             # here reasoned that the dispatches cannot overlap, so the last
             # report was the one worth reading -- and then re-seeded per slice
@@ -1637,9 +901,9 @@ struct BatchMatmul:
             _arm_unpack_arm_known(witness_ptr, "mo.batch_matmul")
             ctx.enqueue_function(
                 f,
-                c_ptr.unsafe_offset(i * c_slice),
-                a_ptr.unsafe_offset(i * a_slice),
-                b_ptr.unsafe_offset(i * b_slice),
+                c_ptr + i * c_slice,
+                a_ptr + i * a_slice,
+                b_ptr + i * b_slice,
                 witness_ptr,
                 Int32(m),
                 Int32(n),
@@ -1928,9 +1192,6 @@ struct GroupNorm:
         num_groups: Int32,
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime assert (
             dtype == DType.float16 or dtype == DType.bfloat16
         ), "mo.reduce.group_norm on the on-device NPU: fp16 or bf16 only"
@@ -2223,7 +1484,7 @@ struct RopeRaggedWithPositionId[interleaved: Bool]:
                     " rows",
                 )
             for h in range(heads):
-                positions_ptr[unsafe_offset=t * heads + h] = pos
+                positions_ptr[t * heads + h] = pos
 
         var f = ctx.load_function[npu_selector_sig](
             function_name=String(_rope_selector[dtype, Self.interleaved]()),
@@ -2250,7 +1511,7 @@ struct RopeRaggedWithPositionId[interleaved: Bool]:
 
 comptime _ROPE_FUSED_STATE_KEY: StaticString = "npu_rope_fused_norm_state"
 
-comptime _RopeStatePtr = Pointer[UInt64, MutUnsafeAnyOrigin]
+comptime _RopeStatePtr = UnsafePointer[UInt64, MutUnsafeAnyOrigin]
 
 comptime _ROPE_ARM_UNPROBED: UInt64 = 0
 comptime _ROPE_ARM_FUSED: UInt64 = 1
@@ -2283,11 +1544,11 @@ def _rope_fused_state() -> _RopeStatePtr:
     """
     var cached = _get_global_or_null(_ROPE_FUSED_STATE_KEY)
     if not cached:
-        var fresh = unsafe_alloc[UInt64](_ROPE_ST_WORDS)
+        var fresh = alloc[UInt64](_ROPE_ST_WORDS)
         for i in range(_ROPE_ST_WORDS):
-            fresh[unsafe_offset=i] = 0
+            fresh[i] = 0
         external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(_ROPE_FUSED_STATE_KEY), fresh.unsafe_bitcast[NoneType]()
+            StringSlice(_ROPE_FUSED_STATE_KEY), fresh.bitcast[NoneType]()
         )
         cached = _get_global_or_null(_ROPE_FUSED_STATE_KEY)
     return _RopeStatePtr(unsafe_from_address=Int(cached.unsafe_value()))
@@ -2313,7 +1574,7 @@ def _rope_pack_layout(rows: Int, freq_words: Int) -> IndexList[4]:
 def _rope_pack_sample(
     position_ids: InputTensor[dtype=DType.uint32, rank=2, ...],
     tokens: Int,
-    freqs: Pointer[UInt32, MutUnsafeAnyOrigin],
+    freqs: UnsafePointer[UInt32, MutUnsafeAnyOrigin],
     freq_words: Int,
 ) -> UInt64:
     """A cheap content fingerprint over both tables' first and last words.
@@ -2327,8 +1588,8 @@ def _rope_pack_sample(
     var h: UInt64 = 0xCBF29CE484222325
     comptime FNV: UInt64 = 0x100000001B3
     for i in range(min(16, freq_words)):
-        h = (h ^ UInt64(freqs[unsafe_offset=i])) * FNV
-        h = (h ^ UInt64(freqs[unsafe_offset=freq_words - 1 - i])) * FNV
+        h = (h ^ UInt64(freqs[i])) * FNV
+        h = (h ^ UInt64(freqs[freq_words - 1 - i])) * FNV
     for i in range(min(16, tokens)):
         h = (h ^ UInt64(position_ids[0, i])) * FNV
         h = (h ^ UInt64(position_ids[0, tokens - 1 - i])) * FNV
@@ -2336,23 +1597,23 @@ def _rope_pack_sample(
 
 
 def _rope_pack_write_header(
-    pack: Pointer[UInt32, MutUnsafeAnyOrigin],
+    pack: UnsafePointer[UInt32, MutUnsafeAnyOrigin],
     layout: IndexList[4],
     length: Int,
     freq_rows: Int,
 ):
     """Seeds the witness words and writes the fused-contract header."""
     for i in range(NPU_WITNESS_BYTES // 4):
-        pack[unsafe_offset=i] = _ROPE_PACK_SEED
+        pack[i] = _ROPE_PACK_SEED
     var hdr = layout[0] // 4
-    pack[unsafe_offset=hdr] = UInt32(RMS_ROPE_MAGIC)
-    pack[unsafe_offset=hdr + 1] = UInt32(layout[1])
-    pack[unsafe_offset=hdr + 2] = UInt32(layout[2])
-    pack[unsafe_offset=hdr + 3] = UInt32(length)
-    pack[unsafe_offset=hdr + 4] = UInt32(freq_rows)
-    pack[unsafe_offset=hdr + 5] = 0
-    pack[unsafe_offset=hdr + 6] = 0
-    pack[unsafe_offset=hdr + 7] = 0
+    pack[hdr] = UInt32(RMS_ROPE_MAGIC)
+    pack[hdr + 1] = UInt32(layout[1])
+    pack[hdr + 2] = UInt32(layout[2])
+    pack[hdr + 3] = UInt32(length)
+    pack[hdr + 4] = UInt32(freq_rows)
+    pack[hdr + 5] = 0
+    pack[hdr + 6] = 0
+    pack[hdr + 7] = 0
 
 
 def _rope_fused_probe(
@@ -2373,20 +1634,20 @@ def _rope_fused_probe(
     )
     var layout = _rope_pack_layout(1, length)
     var pack_buf = ctx.enqueue_create_buffer[DType.uint32](layout[3] // 4)
-    var pack = Pointer[UInt32, MutUnsafeAnyOrigin](
+    var pack = UnsafePointer[UInt32, MutUnsafeAnyOrigin](
         unsafe_from_address=Int(pack_buf.unsafe_ptr())
     )
     _rope_pack_write_header(pack, layout, length, 1)
-    pack[unsafe_offset=layout[1] // 4] = 0
+    pack[layout[1] // 4] = 0
     for i in range(length):
-        pack[unsafe_offset=layout[2] // 4 + i] = 0
+        pack[layout[2] // 4 + i] = 0
     var out_buf = ctx.enqueue_create_buffer[DType.float16](length)
     var x_buf = ctx.enqueue_create_buffer[DType.float16](length)
     var gamma_buf = ctx.enqueue_create_buffer[DType.float16](length)
     for i in range(length):
-        out_buf.unsafe_ptr()[unsafe_offset=i] = Scalar[DType.float16](0)
-        x_buf.unsafe_ptr()[unsafe_offset=i] = Scalar[DType.float16](0)
-        gamma_buf.unsafe_ptr()[unsafe_offset=i] = Scalar[DType.float16](0)
+        out_buf.unsafe_ptr()[i] = Scalar[DType.float16](0)
+        x_buf.unsafe_ptr()[i] = Scalar[DType.float16](0)
+        gamma_buf.unsafe_ptr()[i] = Scalar[DType.float16](0)
     ctx.enqueue_function(
         f,
         out_buf.unsafe_ptr(),
@@ -2401,7 +1662,7 @@ def _rope_fused_probe(
         grid_dim=Dim(NPU_GRID_CORES),
         block_dim=Dim(NPU_THREAD_MASK),
     )
-    var echoed = pack[unsafe_offset=RMS_WITNESS_ARM_WORD]
+    var echoed = pack[RMS_WITNESS_ARM_WORD]
     if echoed == 2:
         raise Error(
             "fused_rms_norm_rope: the fused skel refused the production"
@@ -2483,9 +1744,6 @@ struct RMSNormRope:
         epsilon: Float32,
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime assert dtype == DType.float16, (
             "fused_rms_norm_rope on the on-device NPU: fp16 only -- the"
             " fused selector-5 arm exists for the production f16 row"
@@ -2579,74 +1837,64 @@ struct RMSNormRope:
         # The skel is asked once per process which arm it computes; every
         # fused/sequential decision below flows from that echo, never from a
         # build knob (the 229 class).
-        if state[unsafe_offset=_ROPE_ST_ARM] == _ROPE_ARM_UNPROBED:
-            state[unsafe_offset=_ROPE_ST_ARM] = _rope_fused_probe(
-                ctx, length, epsilon
-            )
+        if state[_ROPE_ST_ARM] == _ROPE_ARM_UNPROBED:
+            state[_ROPE_ST_ARM] = _rope_fused_probe(ctx, length, epsilon)
 
         # The pack is rebuilt in place when the source tables move or their
         # edge fingerprint drifts; its geometry is pinned by the first
         # dispatch because the allocation is process-lifetime.
         var freq_words = freq_rows * length
         var layout = _rope_pack_layout(rows, freq_words)
-        if state[unsafe_offset=_ROPE_ST_PACK] == 0:
+        if state[_ROPE_ST_PACK] == 0:
             var pack_buf = ctx.enqueue_create_buffer[DType.uint32](
                 layout[3] // 4
             )
-            state[unsafe_offset=_ROPE_ST_PACK] = UInt64(
-                Int(pack_buf.unsafe_ptr())
-            )
-            state[unsafe_offset=_ROPE_ST_PACK_WORDS] = UInt64(layout[3] // 4)
-            state[unsafe_offset=_ROPE_ST_ROWS] = UInt64(rows)
-            state[unsafe_offset=_ROPE_ST_LENGTH] = UInt64(length)
-            state[unsafe_offset=_ROPE_ST_HDR_OFF] = UInt64(layout[0])
-            state[unsafe_offset=_ROPE_ST_POS_OFF] = UInt64(layout[1])
-            state[unsafe_offset=_ROPE_ST_FREQS_OFF] = UInt64(layout[2])
+            state[_ROPE_ST_PACK] = UInt64(Int(pack_buf.unsafe_ptr()))
+            state[_ROPE_ST_PACK_WORDS] = UInt64(layout[3] // 4)
+            state[_ROPE_ST_ROWS] = UInt64(rows)
+            state[_ROPE_ST_LENGTH] = UInt64(length)
+            state[_ROPE_ST_HDR_OFF] = UInt64(layout[0])
+            state[_ROPE_ST_POS_OFF] = UInt64(layout[1])
+            state[_ROPE_ST_FREQS_OFF] = UInt64(layout[2])
             _ = pack_buf.take_ptr()
-        elif state[unsafe_offset=_ROPE_ST_ROWS] != UInt64(rows) or state[
-            unsafe_offset=_ROPE_ST_LENGTH
+        elif state[_ROPE_ST_ROWS] != UInt64(rows) or state[
+            _ROPE_ST_LENGTH
         ] != UInt64(length):
             raise Error(
                 "fused_rms_norm_rope on the on-device NPU: a second"
                 " geometry reached the process-lifetime rope pack -- one"
                 " graph geometry per process is the supported shape"
             )
-        var pack = Pointer[UInt32, MutUnsafeAnyOrigin](
-            unsafe_from_address=Int(state[unsafe_offset=_ROPE_ST_PACK])
+        var pack = UnsafePointer[UInt32, MutUnsafeAnyOrigin](
+            unsafe_from_address=Int(state[_ROPE_ST_PACK])
         )
-        var freqs_words_ptr = freqs_cis.unsafe_ptr().unsafe_bitcast[UInt32]()
+        var freqs_words_ptr = freqs_cis.unsafe_ptr().bitcast[UInt32]()
         var sample = _rope_pack_sample(
             position_ids, tokens, freqs_words_ptr, freq_words
         )
         if (
-            state[unsafe_offset=_ROPE_ST_KEY_FREQS]
-            != UInt64(Int(freqs_words_ptr))
-            or state[unsafe_offset=_ROPE_ST_KEY_POS]
-            != UInt64(Int(position_ids.unsafe_ptr()))
-            or state[unsafe_offset=_ROPE_ST_SAMPLE] != sample
+            state[_ROPE_ST_KEY_FREQS] != UInt64(Int(freqs_words_ptr))
+            or state[_ROPE_ST_KEY_POS] != UInt64(Int(position_ids.unsafe_ptr()))
+            or state[_ROPE_ST_SAMPLE] != sample
         ):
             _rope_pack_write_header(pack, layout, length, freq_rows)
-            var pos = pack.unsafe_offset(layout[1] // 4)
+            var pos = pack + layout[1] // 4
             for t in range(tokens):
                 var p = UInt32(position_ids[0, t])
                 for h in range(heads):
-                    pos[unsafe_offset=t * heads + h] = p
-            var freqs_dst = pack.unsafe_offset(layout[2] // 4)
+                    pos[t * heads + h] = p
+            var freqs_dst = pack + layout[2] // 4
             for i in range(freq_words):
-                freqs_dst[unsafe_offset=i] = freqs_words_ptr[unsafe_offset=i]
-            state[unsafe_offset=_ROPE_ST_KEY_FREQS] = UInt64(
-                Int(freqs_words_ptr)
-            )
-            state[unsafe_offset=_ROPE_ST_KEY_POS] = UInt64(
-                Int(position_ids.unsafe_ptr())
-            )
-            state[unsafe_offset=_ROPE_ST_SAMPLE] = sample
+                freqs_dst[i] = freqs_words_ptr[i]
+            state[_ROPE_ST_KEY_FREQS] = UInt64(Int(freqs_words_ptr))
+            state[_ROPE_ST_KEY_POS] = UInt64(Int(position_ids.unsafe_ptr()))
+            state[_ROPE_ST_SAMPLE] = sample
 
-        if state[unsafe_offset=_ROPE_ST_ARM] == _ROPE_ARM_FUSED:
+        if state[_ROPE_ST_ARM] == _ROPE_ARM_FUSED:
             # Treatment delivery is per dispatch, not per process: the arm
             # word is re-seeded before and read after every launch, so a
             # fused dispatch that silently ran the plain norm cannot pass.
-            pack[unsafe_offset=RMS_WITNESS_ARM_WORD] = _ROPE_PACK_SEED
+            pack[RMS_WITNESS_ARM_WORD] = _ROPE_PACK_SEED
             ctx.enqueue_function(
                 f,
                 output.unsafe_ptr(),
@@ -2661,7 +1909,7 @@ struct RMSNormRope:
                 grid_dim=Dim(NPU_GRID_CORES),
                 block_dim=Dim(NPU_THREAD_MASK),
             )
-            var echoed = pack[unsafe_offset=RMS_WITNESS_ARM_WORD]
+            var echoed = pack[RMS_WITNESS_ARM_WORD]
             if echoed != 1:
                 raise Error(
                     (
@@ -2680,16 +1928,14 @@ struct RMSNormRope:
         # in a launcher-owned scratch row set and selector 9 reads it back,
         # the exact arithmetic the unfused graph performs. The rope tables
         # ride the pack as interior pointers, which the transport folds.
-        if state[unsafe_offset=_ROPE_ST_SCRATCH] == 0:
+        if state[_ROPE_ST_SCRATCH] == 0:
             var scratch_buf = ctx.enqueue_create_buffer[DType.float16](
                 rows * length
             )
-            state[unsafe_offset=_ROPE_ST_SCRATCH] = UInt64(
-                Int(scratch_buf.unsafe_ptr())
-            )
+            state[_ROPE_ST_SCRATCH] = UInt64(Int(scratch_buf.unsafe_ptr()))
             _ = scratch_buf.take_ptr()
-        var scratch = Pointer[Float16, MutUnsafeAnyOrigin](
-            unsafe_from_address=Int(state[unsafe_offset=_ROPE_ST_SCRATCH])
+        var scratch = UnsafePointer[Float16, MutUnsafeAnyOrigin](
+            unsafe_from_address=Int(state[_ROPE_ST_SCRATCH])
         )
         ctx.enqueue_function(
             f,
@@ -2713,12 +1959,8 @@ struct RMSNormRope:
             rope_f,
             output.unsafe_ptr(),
             scratch,
-            (
-                pack.unsafe_offset(
-                    Int(state[unsafe_offset=_ROPE_ST_FREQS_OFF]) // 4
-                )
-            ).unsafe_bitcast[Float32](),
-            pack.unsafe_offset(Int(state[unsafe_offset=_ROPE_ST_POS_OFF]) // 4),
+            (pack + Int(state[_ROPE_ST_FREQS_OFF]) // 4).bitcast[Float32](),
+            pack + Int(state[_ROPE_ST_POS_OFF]) // 4,
             _witness_slot(ctx),
             Int32(rows),
             Int32(length),
@@ -2844,10 +2086,10 @@ struct GatedResidual:
             for b in range(outer):
                 ctx.enqueue_function(
                     f,
-                    output.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    x.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    y.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    gate.unsafe_ptr().unsafe_offset(b * row_length),
+                    output.unsafe_ptr() + b * slice_elems,
+                    x.unsafe_ptr() + b * slice_elems,
+                    y.unsafe_ptr() + b * slice_elems,
+                    gate.unsafe_ptr() + b * row_length,
                     _witness_slot(ctx),
                     Int32(rows_per_outer),
                     Int32(row_length),
@@ -2958,10 +2200,10 @@ struct GatedResidualClamp:
             for b in range(outer):
                 ctx.enqueue_function(
                     f,
-                    output.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    x.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    y.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    gate.unsafe_ptr().unsafe_offset(b * row_length),
+                    output.unsafe_ptr() + b * slice_elems,
+                    x.unsafe_ptr() + b * slice_elems,
+                    y.unsafe_ptr() + b * slice_elems,
+                    gate.unsafe_ptr() + b * row_length,
                     _witness_slot(ctx),
                     Int32(rows_per_outer),
                     Int32(row_length),
@@ -3091,10 +2333,10 @@ struct AdaModulate:
             for b in range(outer):
                 ctx.enqueue_function(
                     f,
-                    output.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    x.unsafe_ptr().unsafe_offset(b * slice_elems),
-                    scale.unsafe_ptr().unsafe_offset(b * scale_step),
-                    shift.unsafe_ptr().unsafe_offset(b * shift_step),
+                    output.unsafe_ptr() + b * slice_elems,
+                    x.unsafe_ptr() + b * slice_elems,
+                    scale.unsafe_ptr() + b * scale_step,
+                    shift.unsafe_ptr() + b * shift_step,
                     _witness_slot(ctx),
                     Int32(rows_per_outer),
                     Int32(row_length),
@@ -3118,7 +2360,6 @@ def _swiglu_selector[dtype: DType]() -> StaticString:
 
 
 @extensibility.register("mo.composite.swiglu", type="npu", api="npu")
-@extensibility.accepts_pitched_rows
 struct SwiGLU:
     """Dispatches a `swiglu` selector for `silu(gate) * up`.
 
@@ -3130,12 +2371,9 @@ struct SwiGLU:
 
     The packed rows need not be dense: at twenty of FLUX.2's thirty sites the
     pair is a column slice of the single-stream block's wider fused
-    projection, and `@extensibility.accepts_pitched_rows` is what lets that
-    view cross as-is — its start in the pointer, its row pitch as the
-    selector's third scalar — instead of materializing through the host
-    strided walk first. The decorator is the compiler half of the contract;
-    `_require_pitched_rows` below is the dispatch half that refuses any
-    layout wider than one row pitch.
+    projection, and that view crosses as-is — its start in the pointer, its
+    row pitch as the selector's third scalar — instead of materializing
+    through the host strided walk first.
 
     Not fp16-only: `NPUKernels.def` carries a bf16 twin, which is the dtype
     FLUX.2 runs in.
@@ -3464,9 +2702,6 @@ struct FlashAttention:
         scale: Float32,
         ctx: DeviceContext,
     ) raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime assert (
             rank == 4
         ), "mo.mha.no_cache on the on-device NPU: BSHD inputs only"
@@ -3486,9 +2721,8 @@ struct FlashAttention:
 
         # The selector reads Q/K/V/O as `[seq_len, num_heads, 128]`, which is
         # BSHD's own layout once the batch is one and the head dim is the 128
-        # the kernel is written for. A batch above 1 needs a copy the stub
-        # does not make, so it is refused rather than reinterpreted; a
-        # single head of any other dim takes the decomposed path below.
+        # the kernel is written for. Anything else needs a copy the stub does
+        # not make, so it is refused rather than reinterpreted.
         var batch = Int(q.dim_size(0))
         var seq_len = Int(q.dim_size(1))
         var num_heads = Int(q.dim_size(2))
@@ -3498,17 +2732,12 @@ struct FlashAttention:
                 "mo.mha.no_cache on the on-device NPU: batch must be 1, got ",
                 batch,
             )
-        if head_dim != 128 and num_heads != 1:
-            # A per-head slice of BSHD is strided and nothing stages one
-            # today, so the decomposition below serves exactly one head.
+        if head_dim != 128:
             raise Error(
                 (
-                    "mo.mha.no_cache on the on-device NPU: a head dim off the"
-                    " flash kernel's 128 is decomposed onto the signed"
-                    " matmul/softmax/matmul selectors for one head only; got "
+                    "mo.mha.no_cache on the on-device NPU: head dim must be"
+                    " 128, got "
                 ),
-                num_heads,
-                " heads of ",
                 head_dim,
             )
 
@@ -3526,181 +2755,6 @@ struct FlashAttention:
                 " one shape; grouped or cross attention needs a stub that"
                 " passes their extents separately"
             )
-
-        if head_dim != 128:
-            # The silicon-certified hand driver's decomposition
-            # (`npu_vae_decoder_dispatch.cpp`, `walkAttention`) moved to the
-            # seam the graph crosses: `matmul` (QK^T) -> `softmax` -> `matmul`
-            # (PV), three already-signed selectors, with the scale folded
-            # host-side into a staged Q. It computes the same attention at
-            # the real head dim: one head's QK logit is a SINGLE dot product
-            # over all `head_dim` lanes, so splitting a 512-wide head into
-            # four 128-wide heads would softmax four partial dots separately
-            # -- a different function, not a reshaping. The flash kernel's
-            # own header defers a non-128 instantiation for the same reason
-            # this arm exists: new kernel bytes force a catalogue re-sign,
-            # and its per-head thread split would idle three of four threads
-            # on one head, where these matmuls stripe all four plus the
-            # array.
-            _require_dense(q.shape(), q.strides(), "mo.mha.no_cache", "Q")
-            _require_dense(k.shape(), k.strides(), "mo.mha.no_cache", "K")
-            _require_dense(v.shape(), v.strides(), "mo.mha.no_cache", "V")
-            _require_dense(
-                output.shape(),
-                output.strides(),
-                "mo.mha.no_cache",
-                "the output",
-            )
-
-            var d_pad = ((head_dim + 63) // 64) * 64
-            var s_pad = ((seq_len + 63) // 64) * 64
-
-            # Q is staged regardless (the scale fold), so its pad is free.
-            var q_scaled = ctx.enqueue_create_buffer[output.dtype](
-                seq_len * d_pad
-            )
-            _stage_scaled_rows(
-                q_scaled.unsafe_ptr(),
-                q.unsafe_ptr(),
-                seq_len,
-                head_dim,
-                d_pad,
-                scale,
-            )
-
-            var scores = ctx.enqueue_create_buffer[output.dtype](
-                seq_len * seq_len
-            )
-            var f_matmul = ctx.load_function[npu_selector_sig](
-                function_name=String("matmul"), asm=String("")
-            )
-            var qk_witness = _witness_slot(ctx)
-            _arm_matmul_ran(qk_witness, "mo.mha.no_cache")
-            _arm_unpack_arm_known(qk_witness, "mo.mha.no_cache")
-            # Dense `[1, S, 1, D]` is `[S, D]` row-major: token-major K IS
-            # the `[N=S, K=D]` b-transposed weight, used verbatim with no
-            # transpose -- the driver's own trick. Verbatim only holds where
-            # the skel reads row-major; an array-native serve owes the
-            # selector croutons, so K is then staged like a ragged head dim.
-            if head_dim == d_pad and not _stage_native_weight(
-                seq_len, seq_len, d_pad
-            ):
-                ctx.enqueue_function(
-                    f_matmul,
-                    scores.unsafe_ptr(),
-                    q_scaled.unsafe_ptr(),
-                    k.unsafe_ptr(),
-                    qk_witness,
-                    Int32(seq_len),
-                    Int32(seq_len),
-                    Int32(d_pad),
-                    grid_dim=Dim(NPU_GRID_CORES),
-                    block_dim=Dim(NPU_THREAD_MASK),
-                )
-            else:
-                var k_padded = ctx.enqueue_create_buffer[output.dtype](
-                    seq_len * d_pad
-                )
-                _stage_weight_rows(
-                    k_padded.unsafe_ptr(),
-                    k.unsafe_ptr(),
-                    seq_len,
-                    head_dim,
-                    d_pad,
-                    seq_len,
-                )
-                ctx.enqueue_function(
-                    f_matmul,
-                    scores.unsafe_ptr(),
-                    q_scaled.unsafe_ptr(),
-                    k_padded.unsafe_ptr(),
-                    qk_witness,
-                    Int32(seq_len),
-                    Int32(seq_len),
-                    Int32(d_pad),
-                    grid_dim=Dim(NPU_GRID_CORES),
-                    block_dim=Dim(NPU_THREAD_MASK),
-                )
-                _ = k_padded^
-
-            # One dispatch over all `seq_len` rows of length `seq_len`; the
-            # selector accumulates in fp32, designed for rows this long.
-            var probs = ctx.enqueue_create_buffer[output.dtype](
-                seq_len * seq_len
-            )
-            var f_softmax = ctx.load_function[npu_selector_sig](
-                function_name=String("softmax"), asm=String("")
-            )
-            ctx.enqueue_function(
-                f_softmax,
-                probs.unsafe_ptr(),
-                scores.unsafe_ptr(),
-                _witness_slot(ctx),
-                Int32(seq_len),
-                Int32(seq_len),
-                grid_dim=Dim(NPU_GRID_CORES),
-                block_dim=Dim(NPU_THREAD_MASK),
-            )
-
-            var v_t = ctx.enqueue_create_buffer[output.dtype](head_dim * s_pad)
-            _stage_transposed_weight(
-                v_t.unsafe_ptr(),
-                v.unsafe_ptr(),
-                seq_len,
-                head_dim,
-                s_pad,
-                seq_len,
-            )
-
-            var pv_witness = _witness_slot(ctx)
-            _arm_matmul_ran(pv_witness, "mo.mha.no_cache")
-            _arm_unpack_arm_known(pv_witness, "mo.mha.no_cache")
-            if seq_len == s_pad:
-                ctx.enqueue_function(
-                    f_matmul,
-                    output.unsafe_ptr(),
-                    probs.unsafe_ptr(),
-                    v_t.unsafe_ptr(),
-                    pv_witness,
-                    Int32(seq_len),
-                    Int32(head_dim),
-                    Int32(s_pad),
-                    grid_dim=Dim(NPU_GRID_CORES),
-                    block_dim=Dim(NPU_THREAD_MASK),
-                )
-            else:
-                # The probs are host-readable the moment the softmax launch
-                # returns: an invocation on this transport completes before
-                # it returns. The conv im2col arm documents the same contract
-                # and its batching caveat; this staged read inherits both.
-                var probs_padded = ctx.enqueue_create_buffer[output.dtype](
-                    seq_len * s_pad
-                )
-                _stage_k_padded_rows(
-                    probs_padded.unsafe_ptr(),
-                    probs.unsafe_ptr(),
-                    seq_len,
-                    seq_len,
-                    s_pad,
-                )
-                ctx.enqueue_function(
-                    f_matmul,
-                    output.unsafe_ptr(),
-                    probs_padded.unsafe_ptr(),
-                    v_t.unsafe_ptr(),
-                    pv_witness,
-                    Int32(seq_len),
-                    Int32(head_dim),
-                    Int32(s_pad),
-                    grid_dim=Dim(NPU_GRID_CORES),
-                    block_dim=Dim(NPU_THREAD_MASK),
-                )
-                _ = probs_padded^
-            _ = q_scaled^
-            _ = scores^
-            _ = probs^
-            _ = v_t^
-            return
 
         var f = ctx.load_function[npu_selector_sig](
             function_name=String("mha_no_cache"), asm=String("")
@@ -3944,13 +2998,11 @@ def _copy_view_to_dense[
         for a in range(rank):
             offset += index[a] * in_strides[a]
         if by_run:
-            unsafe_memcpy(
-                dest=out_ptr, src=in_ptr.unsafe_offset(offset), count=run
-            )
-            out_ptr = out_ptr.unsafe_offset(run)
+            unsafe_memcpy(dest=out_ptr, src=in_ptr + offset, count=run)
+            out_ptr += run
         else:
-            out_ptr[unsafe_offset=0] = in_ptr[unsafe_offset=offset]
-            out_ptr = out_ptr.unsafe_offset(1)
+            out_ptr[0] = in_ptr[offset]
+            out_ptr += 1
 
         # Odometer over the axes the copy above did not consume.
         for a in range(last - 1 if by_run else last, -1, -1):
@@ -3958,459 +3010,6 @@ def _copy_view_to_dense[
             if index[a] < Int(output.dim_size(a)):
                 break
             index[a] = 0
-
-
-comptime _RELAYOUT_DEVICE_ENV = "MODULAR_NPU_RELAYOUT_DEVICE"
-
-# Below this the 1.211 ms invoke floor rivals the walk itself (11.9 ns/elem
-# fitted, HOST_WALK_CENSUS.md section 4 -- ~100 K elements to break even on
-# the scalar arm); the census's smallest routable site is 131072 elements.
-comptime _RELAYOUT_MIN_ELEMS = 32768
-
-
-def _relayout_device_requested() -> Bool:
-    """Whether this serve routes materializing permutes onto selector 47.
-
-    Strictly "1", read per dispatch, unset the shipping default -- the host
-    walk -- so the A/B is one artifact and an environment variable apart and
-    the revert is unsetting it (`_add_device_requested`'s contract). Valid
-    only against a catalogue carrying the relayout row: an older signed skel
-    refuses the selector by name and the launch fails LOUDLY at the flush,
-    never silently -- flip the knob after the window certifies, not before.
-    """
-    return getenv(_RELAYOUT_DEVICE_ENV) == "1"
-
-
-def _arm_relayout_ran(slot: _NPUArenaPtr, op: StaticString):
-    """Arms word 7 == RAN on a relayout launch, deferred to the flush.
-
-    CORRECTNESS, not attribution: the row's REFUSED code means the kernel
-    wrote NOTHING, so an accepted flush would hand the graph whatever the
-    output allocation held -- `_require_matmul_ran`'s exact failure class.
-    Accepting only RAN also makes the guard a live control: a host/kernel
-    extent disagreement fails the render at the flush rather than feeding
-    the next op stale bytes.
-    """
-    var entry = _arm_guard(
-        slot,
-        NPU_GUARD_CLASS_CORRECTNESS,
-        NPU_WITNESS_RELAYOUT_PATH,
-        NPU_GUARD_COND_NONE,
-        0,
-        op,
-    )
-    _accept(entry, NPU_RELAYOUT_PATH_RAN)
-
-
-def _relayout_fold[
-    rank: Int
-](
-    dims: IndexList[rank], in_strides: IndexList[rank]
-) -> Tuple[Bool, Int, Int, Int]:
-    """Folds a dense output's axes against its input view's strides, and
-    names the batched 2-D transpose if that is what remains.
-
-    Returns `(routable, batch, rows, cols)` in the relayout row's own terms:
-    the view reads a dense `[batch, rows, cols]` input and the copy writes a
-    dense `[batch, cols, rows]` output. The fold is the standard contiguity
-    merge -- size-1 axes drop, adjacent axes coalesce when `stride[a] ==
-    stride[a+1] * dim[a+1]` -- and the routable patterns after it are exactly
-    `[cols, rows]` at strides `[1, cols]`, with an optional leading batch
-    axis at stride `rows * cols`. A zero stride (broadcast) or a third
-    swapped group (the 6-D unpatchify) never folds to either, which is what
-    keeps this a shape statement rather than a heuristic.
-
-    A pure function of the two lists so the harness can drive it over the
-    census's stride table without a tensor or a transport behind it.
-    """
-    var merged_d = IndexList[rank]()
-    var merged_s = IndexList[rank]()
-    var m = 0
-    for a in range(rank):
-        var d = dims[a]
-        var st = in_strides[a]
-        if d == 1:
-            continue
-        if d <= 0 or st <= 0:
-            return (False, 0, 0, 0)
-        if m > 0 and merged_s[m - 1] == st * d:
-            merged_d[m - 1] = merged_d[m - 1] * d
-            merged_s[m - 1] = st
-            continue
-        merged_d[m] = d
-        merged_s[m] = st
-        m += 1
-
-    if m == 2:
-        var cols = merged_d[0]
-        var rows = merged_d[1]
-        if merged_s[0] != 1 or merged_s[1] != cols:
-            return (False, 0, 0, 0)
-        return (True, 1, rows, cols)
-    if m == 3:
-        var batch = merged_d[0]
-        var cols = merged_d[1]
-        var rows = merged_d[2]
-        if (
-            merged_s[1] != 1
-            or merged_s[2] != cols
-            or merged_s[0] != rows * cols
-        ):
-            return (False, 0, 0, 0)
-        return (True, batch, rows, cols)
-    return (False, 0, 0, 0)
-
-
-def _relayout_device_dispatch[
-    dtype: DType, rank: Int, //
-](
-    z: OutputTensor[dtype=dtype, rank=rank, ...],
-    x: InputTensor[dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises -> Bool:
-    """Dispatches one materializing permute as the `relayout` selector, and
-    reports whether it did; False keeps the copy on the host walk.
-
-    The routable class is exactly what the kernel computes: a BATCHED 2-D
-    TRANSPOSE. The output's dense axes are folded against the input view's
-    strides (the standard contiguity merge -- adjacent axes coalesce when
-    `stride[a] == stride[a+1] * dim[a+1]`), and the copy routes only when
-    what remains is `[J, I]` read at strides `[1, J]`, with an optional
-    leading batch axis at stride `I * J`. That covers both directions of the
-    census's conv wraps (NCHW -> NHWC folds to `(N, C, H*W)`, NHWC -> NCHW to
-    `(N, H*W, C)`) and the attention/tail seq permutes, and it structurally
-    excludes broadcasts (a zero stride never merges to `[1, J]`) and the 6-D
-    unpatchify (three swapped groups do not fold to two).
-
-    Declines -- False, never raising, since the walk is correct for
-    everything -- when the serve did not ask, when the dtype is not the
-    row's fp16, when the fold fails, when the tensor is under
-    `_RELAYOUT_MIN_ELEMS`, or when an extent overflows the wire's Int32
-    scalars. A non-dense output raises, exactly as the walk it replaces
-    would have.
-    """
-    comptime if dtype != DType.float16 or rank < 2:
-        return False
-    else:
-        if not _relayout_device_requested():
-            return False
-        var count = Int(z.size())
-        if count < _RELAYOUT_MIN_ELEMS or count > 0x7FFFFFFF:
-            return False
-        _require_dense(
-            z.shape(), z.strides(), "a materializing view", "the output"
-        )
-
-        var fold = _relayout_fold(z.shape(), x.strides())
-        if not fold[0]:
-            return False
-        var batch = fold[1]
-        var rows = fold[2]
-        var cols = fold[3]
-
-        var f = ctx.load_function[npu_selector_sig](
-            function_name=String("relayout"), asm=String("")
-        )
-        var slot = _witness_slot(ctx)
-        _arm_relayout_ran(slot, "a materializing view")
-        ctx.enqueue_function(
-            f,
-            z.unsafe_ptr(),
-            x.unsafe_ptr(),
-            slot,
-            Int32(batch),
-            Int32(rows),
-            Int32(cols),
-            grid_dim=Dim(NPU_GRID_CORES),
-            block_dim=Dim(NPU_THREAD_MASK),
-        )
-        return True
-
-
-comptime _UPSAMPLE_FOLD_ENV = "MODULAR_NPU_UPSAMPLE_FOLD"
-
-comptime _UPSAMPLE_FOLD_DIAG_ENV = "MODULAR_NPU_UPSAMPLE_FOLD_DIAG"
-
-comptime _UP_TRACE_KEY: StaticString = "npu_upsample_trace"
-
-comptime _UP_TRACE_RECORDS = 8
-comptime _UP_TRACE_WORDS = 8
-"""Per record: kind, out pointer (2 words), and four extents. Eight records
-round-robin; the graph holds one live site at a time, so the depth is slack,
-not a requirement."""
-
-comptime _UP_KIND_EXPANDED: UInt32 = 1
-comptime _UP_KIND_ONES: UInt32 = 2
-comptime _UP_KIND_PRODUCT: UInt32 = 3
-comptime _UP_KIND_PINNED: UInt32 = 4
-
-
-def _upsample_fold_requested() -> Bool:
-    """Whether this serve folds the reshape x broadcast-ones upsample into
-    the conv-epilogue row's gather (`upsample_log2 = 1` on selector 45).
-
-    Strictly "1", read per dispatch, unset the shipping default -- today's
-    walks -- the `_add_device_requested` contract. Valid only against a
-    catalogue whose selector 45 ACCEPTS `upsample_log2 == 1` (this window's
-    skel); against the declared-and-refused vintage the dispatch fails
-    loudly at the flush (slot 7 code 8 fails the correctness guard), never
-    silently.
-    """
-    return getenv(_UPSAMPLE_FOLD_ENV) == "1"
-
-
-def _upsample_fold_diag_requested() -> Bool:
-    """Whether the EAGER fold arm may still dispatch: diagnostic-only since
-    the graph composite (`npu_upsample_conv`) became the production fold.
-
-    The eager arm re-proves the kernel leg on a serve whose MEF predates the
-    composite staging, and only on top of the fold knob itself -- this flag
-    alone arms nothing.
-    """
-    return getenv(_UPSAMPLE_FOLD_DIAG_ENV) == "1"
-
-
-def _up_trace(ctx: DeviceContext) raises -> _NPUArenaPtr:
-    """The upsample recognition trace: the witness arena's own idiom, sized
-    to a page of records.
-
-    WHAT A RECORD IS, and pointedly is not: a record says "the tensor at
-    this pointer was OBSERVED being built as a nearest-2x upsample" -- a
-    recognition, never a data source. No stage ever reads payload through a
-    recorded pointer later than the op that recorded it: the fold's staging
-    reads only the conv's OWN live input (`_upsample_fold_dispatch`), so a
-    stale record can at worst mis-route a conv whose input pointer AND
-    rank-4 extents both collide with a dead site's -- and records are popped
-    on first lookup and cleared at each new site's head to keep even that
-    window one op wide. The eager op stream cannot prove consumers the way
-    the graph pattern (design 2.1's `Fusion.cpp` half, post-window) will;
-    this registry exists so the kernel arm is reachable and certifiable
-    NOW, behind its own default-off knob, and none of it sits on the
-    composite's future path.
-    """
-    var cached = _get_global_or_null(_UP_TRACE_KEY)
-    if not cached:
-        var buf = ctx.enqueue_create_buffer[DType.uint32](
-            4 + _UP_TRACE_RECORDS * _UP_TRACE_WORDS
-        )
-        var fresh = buf.unsafe_ptr()
-        for i in range(4 + _UP_TRACE_RECORDS * _UP_TRACE_WORDS):
-            fresh[unsafe_offset=i] = 0
-        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(_UP_TRACE_KEY), fresh.unsafe_bitcast[NoneType]()
-        )
-        _ = buf.take_ptr()
-        cached = _get_global_or_null(_UP_TRACE_KEY)
-    return _arena_ptr(cached.unsafe_value())
-
-
-def _up_record(
-    trace: _NPUArenaPtr,
-    kind: UInt32,
-    out_addr: Int,
-    e0: Int,
-    e1: Int,
-    e2: Int,
-    e3: Int,
-):
-    """Writes one recognition, overwriting any record with the same pointer
-    (the buffer was rebuilt; the old claim is dead)."""
-    var slot = -1
-    for i in range(_UP_TRACE_RECORDS):
-        var base = 4 + i * _UP_TRACE_WORDS
-        if (
-            trace[unsafe_offset=base] != 0
-            and Int(trace[unsafe_offset=base + 1])
-            | (Int(trace[unsafe_offset=base + 2]) << 32) == out_addr
-        ):
-            slot = i
-            break
-    if slot < 0:
-        slot = Int(trace[unsafe_offset=0]) % _UP_TRACE_RECORDS
-        trace[unsafe_offset=0] = UInt32(
-            (Int(trace[unsafe_offset=0]) + 1) % _UP_TRACE_RECORDS
-        )
-    var base = 4 + slot * _UP_TRACE_WORDS
-    trace[unsafe_offset=base] = kind
-    trace[unsafe_offset=base + 1] = UInt32(out_addr & 0xFFFFFFFF)
-    trace[unsafe_offset=base + 2] = UInt32((out_addr >> 32) & 0xFFFFFFFF)
-    trace[unsafe_offset=base + 3] = UInt32(e0)
-    trace[unsafe_offset=base + 4] = UInt32(e1)
-    trace[unsafe_offset=base + 5] = UInt32(e2)
-    trace[unsafe_offset=base + 6] = UInt32(e3)
-
-
-def _up_take(
-    trace: _NPUArenaPtr, kind: UInt32, addr: Int, pop: Bool
-) -> Tuple[Bool, Int, Int, Int, Int]:
-    """Finds a recognition by kind and pointer; `pop` consumes it."""
-    for i in range(_UP_TRACE_RECORDS):
-        var base = 4 + i * _UP_TRACE_WORDS
-        if trace[unsafe_offset=base] != kind:
-            continue
-        if (
-            Int(trace[unsafe_offset=base + 1])
-            | (Int(trace[unsafe_offset=base + 2]) << 32)
-        ) != addr:
-            continue
-        var e0 = Int(trace[unsafe_offset=base + 3])
-        var e1 = Int(trace[unsafe_offset=base + 4])
-        var e2 = Int(trace[unsafe_offset=base + 5])
-        var e3 = Int(trace[unsafe_offset=base + 6])
-        if pop:
-            trace[unsafe_offset=base] = 0
-        return (True, e0, e1, e2, e3)
-    return (False, 0, 0, 0, 0)
-
-
-def _up_clear(trace: _NPUArenaPtr):
-    """Drops every recognition: a new site's head starts a clean table."""
-    for i in range(_UP_TRACE_RECORDS):
-        trace[unsafe_offset=4 + i * _UP_TRACE_WORDS] = 0
-
-
-def _upsample_note_materialize[
-    dtype: DType, rank: Int, //
-](
-    z: OutputTensor[dtype=dtype, rank=rank, ...],
-    x: InputTensor[dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises:
-    """Recognizes the upsample idiom's two materialize legs and the conv
-    wrap that follows them, off the exact shapes `interpolate_2d_nearest`
-    authors (`vae_flux2.py:724-763`).
-
-    Three signatures, each a strict stride statement (anything else is not
-    the idiom and records nothing):
-
-    - EXPANDED: rank-6 `[N, C, H, 2, W, 2]` reading `[N, C, H, W]` dense
-      with stride 0 on both duplicated axes -- `x_reshaped` broadcast.
-    - ONES: the same rank-6 extents reading a 4-element source (strides
-      `[0, 0, 0, 2, 0, 1]`), all four elements exactly 1.0 -- the
-      broadcast-ones operand, read HERE while it is this op's own live
-      input.
-    - PINNED: rank-4 `[N, 2H, 2W, C]` reading `[N, C, 2H, 2W]` dense (the
-      conv wrap's pin) whose base pointer carries a PRODUCT recognition
-      with agreeing extents.
-
-    Recording happens AFTER the walk produced the dense output, so every
-    consumer of these tensors is untouched whether or not a conv ever folds.
-    """
-    comptime if dtype != DType.float16:
-        return
-    comptime if rank == 6:
-        var n = Int(z.dim_size(0))
-        var c = Int(z.dim_size(1))
-        var h = Int(z.dim_size(2))
-        var w = Int(z.dim_size(4))
-        if Int(z.dim_size(3)) != 2 or Int(z.dim_size(5)) != 2:
-            return
-        var s = x.strides()
-        var trace = _up_trace(ctx)
-        if (
-            s[3] == 0
-            and s[5] == 0
-            and s[4] == 1
-            and s[2] == w
-            and s[1] == h * w
-            and (n == 1 or s[0] == c * h * w)
-        ):
-            # A new site begins at its expansion; drop stale recognitions.
-            _up_clear(trace)
-            _up_record(
-                trace,
-                _UP_KIND_EXPANDED,
-                Int(z.unsafe_ptr()),
-                n,
-                c,
-                h,
-                w,
-            )
-            return
-        if s[0] == 0 and s[1] == 0 and s[2] == 0 and s[3] == 2 and s[4] == 0 and s[5] == 1:
-            var src = x.unsafe_ptr()
-            for i in range(4):
-                if src[unsafe_offset=i] != Scalar[dtype](1):
-                    return
-            _up_record(
-                trace, _UP_KIND_ONES, Int(z.unsafe_ptr()), n, c, h, w
-            )
-        return
-    comptime if rank == 4:
-        var n4 = Int(z.dim_size(0))
-        var h2 = Int(z.dim_size(1))
-        var w2 = Int(z.dim_size(2))
-        var c4 = Int(z.dim_size(3))
-        var s4 = x.strides()
-        if not (
-            s4[3] == h2 * w2
-            and s4[1] == w2
-            and s4[2] == 1
-            and (n4 == 1 or s4[0] == c4 * h2 * w2)
-        ):
-            return
-        var trace = _up_trace(ctx)
-        var prod = _up_take(
-            trace, _UP_KIND_PRODUCT, Int(x.unsafe_ptr()), False
-        )
-        if (
-            prod[0]
-            and prod[1] == n4
-            and prod[2] == c4
-            and 2 * prod[3] == h2
-            and 2 * prod[4] == w2
-        ):
-            _up_record(
-                trace,
-                _UP_KIND_PINNED,
-                Int(z.unsafe_ptr()),
-                n4,
-                c4,
-                prod[3],
-                prod[4],
-            )
-
-
-def _upsample_note_mul[
-    dtype: DType, rank: Int, //
-](
-    output: OutputTensor[dtype=dtype, rank=rank, ...],
-    x: InputTensor[dtype=dtype, rank=rank, ...],
-    y: InputTensor[dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises:
-    """Joins the idiom's mul: EXPANDED times ONES (either order) makes the
-    product a recognized upsample. The reshape that follows is a view, so
-    the PRODUCT pointer is what the conv wrap's pin will read."""
-    comptime if dtype != DType.float16 or rank != 6:
-        return
-    else:
-        var trace = _up_trace(ctx)
-        var ex = _up_take(trace, _UP_KIND_EXPANDED, Int(x.unsafe_ptr()), False)
-        var ones_addr = Int(y.unsafe_ptr())
-        if not ex[0]:
-            ex = _up_take(trace, _UP_KIND_EXPANDED, Int(y.unsafe_ptr()), False)
-            ones_addr = Int(x.unsafe_ptr())
-        if not ex[0]:
-            return
-        if not _up_take(trace, _UP_KIND_ONES, ones_addr, False)[0]:
-            return
-        if (
-            Int(output.dim_size(0)) != ex[1]
-            or Int(output.dim_size(1)) != ex[2]
-            or Int(output.dim_size(2)) != ex[3]
-            or Int(output.dim_size(4)) != ex[4]
-        ):
-            return
-        _up_record(
-            trace,
-            _UP_KIND_PRODUCT,
-            Int(output.unsafe_ptr()),
-            ex[1],
-            ex[2],
-            ex[3],
-            ex[4],
-        )
 
 
 @register_internal("mogg.call.materialize.npu")
@@ -4445,23 +3044,8 @@ def npu_view_copy[
     `mo.slice` out of the view machinery on this device, turning every alias
     into a copy -- including the 162 whole-tensor slices a FLUX denoise step
     folds for free, 100 of which slice a `[3072, 3072]` weight.
-
-    Under `MODULAR_NPU_RELAYOUT_DEVICE=1` the transpose class -- the batched
-    2-D fold `_relayout_device_dispatch` names, 77 sites and 80.6% of the
-    measured non-dispatch pool -- goes to the signed `relayout` row instead,
-    and everything it declines (broadcasts, the 6-D unpatchify, small
-    tensors, non-fp16) keeps this walk unchanged.
     """
-    # A held matmul-chain member must run before this op touches any
-    # operand: this is the 186A host-reader class, closed per site.
-    _matmul_chain_flush()
-    if _relayout_device_dispatch(z, x, ctx):
-        if _upsample_fold_requested():
-            _upsample_note_materialize(z, x, ctx)
-        return
     _copy_view_to_dense(z, x, "a materializing view")
-    if _upsample_fold_requested():
-        _upsample_note_materialize(z, x, ctx)
 
 
 @register_internal("mgp.buffer.concat.npu")
@@ -4490,9 +3074,6 @@ def npu_buffer_concat[
     Byte-blind by construction: a buffer join has no axis and no dtype, so
     the slab arithmetic `mo.concat`'s stub needs has no analogue here.
     """
-    # A held matmul-chain member must run before this op touches any
-    # operand: this is the 186A host-reader class, closed per site.
-    _matmul_chain_flush()
     var total = 0
     for i in range(len(inputs)):
         total += inputs[i].size()
@@ -4509,7 +3090,7 @@ def npu_buffer_concat[
         var n = inputs[i].size()
         if n != 0:
             unsafe_memcpy(
-                dest=out_ptr.unsafe_offset(offset),
+                dest=out_ptr + offset,
                 src=inputs[i].unsafe_ptr(),
                 count=n,
             )
@@ -4549,9 +3130,6 @@ struct Concat:
         inputs: InputVariadicTensors[dtype=dtype, rank=rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime ax = axis if axis >= 0 else axis + rank
         comptime assert (
             0 <= ax < rank
@@ -4591,10 +3169,8 @@ struct Concat:
                 var block = extent * inner
                 for slab in range(outer):
                     unsafe_memcpy(
-                        dest=out_ptr.unsafe_offset(
-                            slab * out_slab
-                        ).unsafe_offset(offset * inner),
-                        src=src.unsafe_offset(slab * block),
+                        dest=out_ptr + slab * out_slab + offset * inner,
+                        src=src + slab * block,
                         count=block,
                     )
             offset += extent
@@ -4636,9 +3212,6 @@ struct Split:
         split_sizes: InputTensor[rank=1, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime ax = axis if axis >= 0 else axis + rank
         comptime assert (
             0 <= ax < rank
@@ -4670,10 +3243,8 @@ struct Split:
                 var block = extent * inner
                 for slab in range(outer):
                     unsafe_memcpy(
-                        dest=dst.unsafe_offset(slab * block),
-                        src=in_ptr.unsafe_offset(slab * in_slab).unsafe_offset(
-                            offset * inner
-                        ),
+                        dest=dst + slab * block,
+                        src=in_ptr + slab * in_slab + offset * inner,
                         count=block,
                     )
             offset += extent
@@ -4730,9 +3301,6 @@ struct Cast:
         input: InputTensor[rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         if output.shape() != input.shape():
             raise Error(
                 "mo.cast on the on-device NPU: input and output shapes differ"
@@ -4753,9 +3321,9 @@ struct Cast:
         comptime W = 8
         var vectorized_end = count - (count % W)
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, src.unsafe_load[W](i).cast[output.dtype]())
+            dst.store[W](i, src.load[W](i).cast[output.dtype]())
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, src.unsafe_load[1](i).cast[output.dtype]())
+            dst.store[1](i, src.load[1](i).cast[output.dtype]())
 
 
 def _binary_host_walk[
@@ -4815,37 +3383,29 @@ def _binary_host_walk[
     var vectorized_end = count - (count % W)
     comptime if op == "mo.add":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, xs.unsafe_load[W](i) + ys.unsafe_load[W](i))
+            dst.store[W](i, xs.load[W](i) + ys.load[W](i))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, xs.unsafe_load[1](i) + ys.unsafe_load[1](i))
+            dst.store[1](i, xs.load[1](i) + ys.load[1](i))
     elif op == "mo.sub":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, xs.unsafe_load[W](i) - ys.unsafe_load[W](i))
+            dst.store[W](i, xs.load[W](i) - ys.load[W](i))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, xs.unsafe_load[1](i) - ys.unsafe_load[1](i))
+            dst.store[1](i, xs.load[1](i) - ys.load[1](i))
     elif op == "mo.mul":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, xs.unsafe_load[W](i) * ys.unsafe_load[W](i))
+            dst.store[W](i, xs.load[W](i) * ys.load[W](i))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, xs.unsafe_load[1](i) * ys.unsafe_load[1](i))
+            dst.store[1](i, xs.load[1](i) * ys.load[1](i))
     elif op == "mo.min":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](
-                i, min(xs.unsafe_load[W](i), ys.unsafe_load[W](i))
-            )
+            dst.store[W](i, min(xs.load[W](i), ys.load[W](i)))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](
-                i, min(xs.unsafe_load[1](i), ys.unsafe_load[1](i))
-            )
+            dst.store[1](i, min(xs.load[1](i), ys.load[1](i)))
     elif op == "mo.max":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](
-                i, max(xs.unsafe_load[W](i), ys.unsafe_load[W](i))
-            )
+            dst.store[W](i, max(xs.load[W](i), ys.load[W](i)))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](
-                i, max(xs.unsafe_load[1](i), ys.unsafe_load[1](i))
-            )
+            dst.store[1](i, max(xs.load[1](i), ys.load[1](i)))
     else:
         comptime assert False, "unmapped binary host-walk op"
 
@@ -4882,187 +3442,26 @@ def _unary_host_walk[
     var vectorized_end = count - (count % W)
     comptime if op == "mo.sqrt":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, sqrt(xs.unsafe_load[W](i)))
+            dst.store[W](i, sqrt(xs.load[W](i)))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, sqrt(xs.unsafe_load[1](i)))
+            dst.store[1](i, sqrt(xs.load[1](i)))
     elif op == "mo.round":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, round(xs.unsafe_load[W](i)))
+            dst.store[W](i, round(xs.load[W](i)))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, round(xs.unsafe_load[1](i)))
+            dst.store[1](i, round(xs.load[1](i)))
     elif op == "mo.relu":
         for i in range(0, vectorized_end, W):
-            dst.unsafe_store[W](i, max(xs.unsafe_load[W](i), 0))
+            dst.store[W](i, max(xs.load[W](i), 0))
         for i in range(vectorized_end, count):
-            dst.unsafe_store[1](i, max(xs.unsafe_load[1](i), 0))
+            dst.store[1](i, max(xs.load[1](i), 0))
     else:
         comptime assert False, "unmapped unary host-walk op"
 
 
-comptime _ADD_DEVICE_ENV = "MODULAR_NPU_ADD_DEVICE"
-
-# The ones gate is staged per dispatch, so its length is this route's own
-# cost; the cap keeps that staging proportional to what one dispatch saves.
-# Every trailing axis the packed-32 VAE census stages is <= 512.
-comptime _ADD_ONES_GATE_CAP = 16384
-
-
-def _add_device_requested() -> Bool:
-    """Whether this serve routes bare `mo.add`s onto the signed kernel set.
-
-    Strictly "1", the reading `_stage_native_weight` gives its own variable,
-    and read per dispatch for the same reason: one MEF outlives any single
-    serve's environment. Unset is the shipping default -- the host walk --
-    so the two arms of an A/B are one artifact and an environment variable
-    apart, and the revert is unsetting it.
-    """
-    return getenv(_ADD_DEVICE_ENV) == "1"
-
-
-def _add_gate_residual_dispatch[
-    dtype: DType,
-    rank: Int,
-    //,
-](
-    output: OutputTensor[dtype=dtype, rank=rank, ...],
-    x: InputTensor[dtype=dtype, rank=rank, ...],
-    y: InputTensor[dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises -> Bool:
-    """Dispatches one bare fp16/bf16 add as `gate_residual` with a ones gate,
-    and reports whether it did; False keeps the add on the host walk.
-
-    The signed set carries no plain half-precision add row and rows are
-    append-only between re-sign windows -- but `gate_residual` (selector 19,
-    bf16 twin at 20) already computes `out = x + gate * y` with
-    `gate_row_stride == 0` sharing one length-D gate across every row
-    (`modulation_kernel.mojo`, `gate_residual_2d`). A staged ones gate makes
-    that a plain elementwise add exactly: the kernel accumulates in fp32
-    (`ACCUM`), where `1.0 * y` is exact, and its one rounding on store is the
-    correctly rounded half-precision sum -- the value the host walk's native
-    add produces. Staging the small operand a selector needs is `Matmul`'s
-    own k-pad move, and the buffer is dropped after the enqueue the same way.
-
-    Declines -- returning False rather than raising, since the host walk is
-    correct for everything and owns the refusal messages -- when the serve
-    did not ask (`MODULAR_NPU_ADD_DEVICE`), when the shapes differ (the walk
-    refuses those by name), when the tensor is empty, when the extents
-    overflow the wire's Int32 scalars or the kernel's own 32-bit row
-    arithmetic, or when the trailing axis is past `_ADD_ONES_GATE_CAP`.
-    Density is required rather than declined: the walk would refuse a
-    non-dense operand identically, so raising here changes nothing
-    observable.
-    """
-    comptime assert (
-        dtype == DType.float16 or dtype == DType.bfloat16
-    ), "the gate_residual selectors are fp16 and bf16 (NPUKernels.def 19/20)"
-    comptime assert (
-        rank >= 2
-    ), "a rank-1 add has no leading axis to take the row count from"
-    if not _add_device_requested():
-        return False
-    if output.shape() != x.shape() or output.shape() != y.shape():
-        return False
-    var row_length = Int(output.dim_size(rank - 1))
-    if row_length <= 0 or row_length > _ADD_ONES_GATE_CAP:
-        return False
-    var num_rows = 1
-    for i in range(rank - 1):
-        num_rows *= Int(output.dim_size(i))
-    if num_rows <= 0 or num_rows > 0x7FFFFFFF // row_length:
-        return False
-    _require_dense(output.shape(), output.strides(), "mo.add", "the output")
-    _require_dense(x.shape(), x.strides(), "mo.add", "x")
-    _require_dense(y.shape(), y.strides(), "mo.add", "y")
-
-    var gate = ctx.enqueue_create_buffer[dtype](row_length)
-    var gate_ptr = gate.unsafe_ptr()
-    for j in range(row_length):
-        gate_ptr[unsafe_offset=j] = Scalar[dtype](1)
-
-    var f = ctx.load_function[npu_selector_sig](
-        function_name=String(_gate_residual_selector[dtype]()), asm=String("")
-    )
-    ctx.enqueue_function(
-        f,
-        output.unsafe_ptr(),
-        x.unsafe_ptr(),
-        y.unsafe_ptr(),
-        gate_ptr,
-        _witness_slot(ctx),
-        Int32(num_rows),
-        Int32(row_length),
-        Int32(0),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
-    )
-    _ = gate^
-    return True
-
-
-def _add_vadd_dispatch[
-    dtype: DType,
-    rank: Int,
-    //,
-](
-    output: OutputTensor[dtype=dtype, rank=rank, ...],
-    x: InputTensor[dtype=dtype, rank=rank, ...],
-    y: InputTensor[dtype=dtype, rank=rank, ...],
-    ctx: DeviceContext,
-) raises -> Bool:
-    """Dispatches one bare fp32 add as the `vadd` selector, and reports
-    whether it did; False keeps the add on the host walk.
-
-    `vadd` (selector 0) is the flat fp32 elementwise add: lhs, rhs and result
-    buffers in that order, one element-count scalar, no witness buffer. The
-    slot is still taken -- every graph-path launch takes one, and the take is
-    where the transport-mode refusals live (`_witness_slot`) -- it just has
-    no argument slot to travel in, so nothing writes it and the flush reads
-    no guard from it. Declines mirror `_add_gate_residual_dispatch`'s, minus
-    the gate staging this route does not need.
-    """
-    comptime assert (
-        dtype == DType.float32
-    ), "the vadd selector is fp32 (NPUKernels.def selector 0)"
-    if not _add_device_requested():
-        return False
-    if output.shape() != x.shape() or output.shape() != y.shape():
-        return False
-    var count = Int(output.size())
-    if count <= 0 or count > 0x7FFFFFFF:
-        return False
-    _require_dense(output.shape(), output.strides(), "mo.add", "the output")
-    _require_dense(x.shape(), x.strides(), "mo.add", "x")
-    _require_dense(y.shape(), y.strides(), "mo.add", "y")
-
-    var f = ctx.load_function[npu_selector_sig](
-        function_name=String("vadd"), asm=String("")
-    )
-    _ = _witness_slot(ctx)
-    ctx.enqueue_function(
-        f,
-        x.unsafe_ptr(),
-        y.unsafe_ptr(),
-        output.unsafe_ptr(),
-        Int32(count),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
-    )
-    return True
-
-
 @extensibility.register("mo.add", type="npu", api="npu")
 struct Add:
-    """The bare-add tail: signed selectors when the serve asks, else the host.
-
-    `MODULAR_NPU_ADD_DEVICE=1` routes eligible same-shape dense adds onto the
-    signed kernel set -- fp16/bf16 through `gate_residual`'s ones-gate arm,
-    fp32 through `vadd` -- and anything either route declines walks on the
-    host exactly as before. The composite rules still own the gated shapes
-    they claim; what this moves is the bare tail, which the packed-32 VAE
-    decode stages 58 of (`rmo.add`: every residual close, the upsample joins,
-    and the output head's range-map adds).
-    """
+    """The bare-add tail, on the host; the composite rules own the rest."""
 
     @staticmethod
     def execute[
@@ -5073,17 +3472,6 @@ struct Add:
         y: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
-        comptime if (
-            output.dtype == DType.float16 or output.dtype == DType.bfloat16
-        ) and output.rank >= 2:
-            if _add_gate_residual_dispatch(output, x, y, ctx):
-                return
-        comptime if output.dtype == DType.float32:
-            if _add_vadd_dispatch(output, x, y, ctx):
-                return
         _binary_host_walk[op="mo.add"](output, x, y)
 
 
@@ -5100,20 +3488,13 @@ struct Sub:
         y: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _binary_host_walk[op="mo.sub"](output, x, y)
 
 
 @extensibility.register("mo.mul", type="npu", api="npu")
 struct Mul:
     """The bare-product tail (rope, SwiGLU's two-projection spelling, the
-    range map), on the host.
-
-    Under `MODULAR_NPU_UPSAMPLE_FOLD=1` the walk also NOTES the upsample
-    idiom's join (EXPANDED times ONES) after producing it -- recognition
-    only, the product's bytes and every consumer unchanged."""
+    range map), on the host."""
 
     @staticmethod
     def execute[
@@ -5124,12 +3505,7 @@ struct Mul:
         y: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _binary_host_walk[op="mo.mul"](output, x, y)
-        if _upsample_fold_requested():
-            _upsample_note_mul(output, x, y, ctx)
 
 
 @extensibility.register("mo.min", type="npu", api="npu")
@@ -5145,9 +3521,6 @@ struct Min:
         y: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _binary_host_walk[op="mo.min"](output, x, y)
 
 
@@ -5164,9 +3537,6 @@ struct Max:
         y: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _binary_host_walk[op="mo.max"](output, x, y)
 
 
@@ -5182,9 +3552,6 @@ struct Sqrt:
         x: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _unary_host_walk[op="mo.sqrt"](output, x)
 
 
@@ -5200,9 +3567,6 @@ struct Round:
         x: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _unary_host_walk[op="mo.round"](output, x)
 
 
@@ -5218,9 +3582,6 @@ struct Relu:
         x: InputTensor[dtype=output.dtype, rank=output.rank, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         _unary_host_walk[op="mo.relu"](output, x)
 
 
@@ -5247,9 +3608,6 @@ struct Gather:
         indices: InputTensor,
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime assert axis == 0, (
             "mo.gather on the on-device NPU: the host walk copies table rows,"
             " so only axis 0 is served"
@@ -5287,7 +3645,7 @@ struct Gather:
         var ids = indices.unsafe_ptr()
         var dst = output.unsafe_ptr()
         for i in range(rows):
-            var row = Int(ids[unsafe_offset=i])
+            var row = Int(ids[i])
             # A loud bound beats reading whatever follows the table: the ids
             # are runtime data, and this transport's device memory is host
             # memory, so the check costs a compare.
@@ -5300,414 +3658,8 @@ struct Gather:
                     " rows",
                 )
             unsafe_memcpy(
-                dest=dst.unsafe_offset(i * width),
-                src=table.unsafe_offset(row * width),
-                count=width,
+                dest=dst + i * width, src=table + row * width, count=width
             )
-
-
-def _permute_filter_fused_k[
-    dtype: DType, dst_origin: MutOrigin, src_origin: MutOrigin, //
-](
-    dst: Pointer[Scalar[dtype], dst_origin],
-    src: Pointer[Scalar[dtype], src_origin],
-    c_out: Int,
-    c_in: Int,
-    r: Int,
-    s: Int,
-):
-    """Permutes an `[F, C, R, S]` filter into the fused arm's k order.
-
-    The fused selectors gather A in `(r*S + s)*C_in + c` order -- channel
-    FASTEST within a tap -- where the FCRS checkpoint is channel-slowest, so
-    the `[C_out, K]` b-transposed rows the kernel reads are this permutation
-    of the checkpoint bytes. `C_out * K` element moves, the same size as the
-    zero-padded copy the materialising arm stages per dispatch.
-
-    Args:
-        dst: The `[c_out, c_in * r * s]` destination; every element written.
-        src: The `[c_out, c_in, r, s]` row-major checkpoint filter.
-        c_out: Filter count, the destination's row count.
-        c_in: Input channels; channel-fastest within each destination tap.
-        r: Filter height.
-        s: Filter width.
-    """
-    var k = c_in * r * s
-    for n in range(c_out):
-        for cc in range(c_in):
-            for rr in range(r):
-                for ss in range(s):
-                    dst[unsafe_offset=n * k + (rr * s + ss) * c_in + cc] = src[
-                        unsafe_offset=((n * c_in + cc) * r + rr) * s + ss
-                    ]
-
-
-def _upsample_fold_dispatch[
-    dtype: DType,
-    out_origin: MutOrigin,
-    in_origin: MutOrigin,
-    f_origin: MutOrigin,
-    //,
-](
-    out_base: Pointer[Scalar[dtype], out_origin],
-    in_ptr: Pointer[Scalar[dtype], in_origin],
-    f_src: Pointer[Scalar[dtype], f_origin],
-    batch: Int,
-    h_in: Int,
-    w_in: Int,
-    c_in: Int,
-    c_out: Int,
-    r: Int,
-    s: Int,
-    pad_top: Int,
-    pad_left: Int,
-    h_out: Int,
-    w_out: Int,
-    m: Int,
-    k: Int,
-    ctx: DeviceContext,
-) raises -> Bool:
-    """Dispatches one recognized upsample-fed conv as selector 45 with
-    `upsample_log2 = 1`, and reports whether it did; False keeps today's
-    route untouched.
-
-    The admission is deliberately the CONJUNCTION of the recognition and
-    the arm that implements the fold: a PINNED recognition whose extents
-    agree with this conv's operands, the fused-conv contract
-    (`C_in % 64 == 0`), the serve asking for the array
-    (`MODULAR_NPU_CONV_HMX`), and `matmul_bt_hmx_accepts` in the fold's own
-    coordinates (m, k are unchanged by it). Anything short of all four
-    declines here, because the kernel refuses a fold it cannot run on the
-    array (slot 7 code 8) rather than degrading -- and a declined dispatch
-    would fail the correctness guard with the output absent. Since the graph
-    composite became the production fold, an admitted recognition ALSO
-    demands `MODULAR_NPU_UPSAMPLE_FOLD_DIAG=1` or it logs and stands down
-    (`_upsample_fold_diag_requested`).
-
-    THE SMALL MAP IS STAGED FROM THE CONV'S OWN LIVE INPUT, not from any
-    recorded pointer: the input IS the materialized 2x map (the walks all
-    still ran; the knob buys certification, the pool win lands with the
-    graph composite -- `UpsampleConv` below), so its even rows and columns
-    ARE the pre-upsample map, bit-for-bit. Nothing is ever read through a
-    pointer that could have died -- `_up_trace`'s contract. Filter staging
-    and the launch itself are `_launch_upsample_conv_ep`, shared with the
-    composite's registration.
-    """
-    if not _upsample_fold_requested():
-        return False
-    if not _conv_hmx_requested():
-        return False
-    if not matmul_bt_hmx_accepts(m, c_out, k, 0, c_out):
-        return False
-    var trace = _up_trace(ctx)
-    var pin = _up_take(trace, _UP_KIND_PINNED, Int(in_ptr), True)
-    if not pin[0]:
-        return False
-    var h_small = pin[3]
-    var w_small = pin[4]
-    if (
-        pin[1] != batch
-        or pin[2] != c_in
-        or 2 * h_small != h_in
-        or 2 * w_small != w_in
-    ):
-        return False
-    # Post-recognition so a production serve (fold knob armed for the
-    # composite) never logs on the convs the graph already folded.
-    if not _upsample_fold_diag_requested():
-        print(
-            "npu upsample fold: eager arm recognized this conv but stands"
-            " down -- the graph composite (npu_upsample_conv) is the"
-            " production fold; set MODULAR_NPU_UPSAMPLE_FOLD_DIAG=1 to"
-            " dispatch the eager arm for diagnosis"
-        )
-        return False
-
-    # The pre-upsample map, subsampled out of this op's own dense input:
-    # rows 2h, columns 2w, all C channels per pick -- one C-length run each.
-    var small = ctx.enqueue_create_buffer[dtype](
-        batch * h_small * w_small * c_in
-    )
-    var small_ptr = small.unsafe_ptr()
-    for b in range(batch):
-        var src_plane = b * h_in * w_in * c_in
-        var dst_plane = b * h_small * w_small * c_in
-        for h in range(h_small):
-            var src_row = src_plane + (2 * h) * w_in * c_in
-            var dst_row = dst_plane + h * w_small * c_in
-            for w in range(w_small):
-                unsafe_memcpy(
-                    dest=small_ptr.unsafe_offset(dst_row + w * c_in),
-                    src=in_ptr.unsafe_offset(src_row + (2 * w) * c_in),
-                    count=c_in,
-                )
-
-    _launch_upsample_conv_ep(
-        out_base,
-        small_ptr,
-        f_src,
-        batch,
-        h_small,
-        w_small,
-        c_in,
-        c_out,
-        r,
-        s,
-        pad_top,
-        pad_left,
-        h_out,
-        w_out,
-        m,
-        k,
-        "mo.conv upsample fold",
-        ctx,
-    )
-    _ = small^
-    return True
-
-
-def _launch_upsample_conv_ep[
-    dtype: DType,
-    out_origin: MutOrigin,
-    in_origin: MutOrigin,
-    f_origin: MutOrigin,
-    //,
-](
-    out_base: Pointer[Scalar[dtype], out_origin],
-    small_ptr: Pointer[Scalar[dtype], in_origin],
-    f_src: Pointer[Scalar[dtype], f_origin],
-    batch: Int,
-    h_small: Int,
-    w_small: Int,
-    c_in: Int,
-    c_out: Int,
-    r: Int,
-    s: Int,
-    pad_top: Int,
-    pad_left: Int,
-    h_out: Int,
-    w_out: Int,
-    m: Int,
-    k: Int,
-    op: StaticString,
-    ctx: DeviceContext,
-) raises:
-    """Stages the filter artefact and dispatches selector 45 with
-    `upsample_log2 = 1` over an already-small `[batch, h_small, w_small,
-    c_in]` map, one launch per batch index.
-
-    The tail both fold arms share: the eager recognizer hands it the map it
-    subsampled out of the conv's materialized input, and the graph
-    composite's registration hands it the conv's own live input, which IS
-    the pre-upsample map when the composite staged. Admission is the
-    caller's job -- everything here assumes the shape was accepted.
-
-    The filter stages exactly as the selector-40 route stages it -- fused-k
-    permute, croutons when the skel is array-native -- plus the ep row's
-    bias tail, ZERO-FILLED: this graph's bias lands in a separate `mo.add`
-    the fold does not claim, and a zero row through the fp16 widen-add is
-    the identity (the sel-41 rule: unconditional, never a branch).
-    """
-    var artefact = ctx.enqueue_create_buffer[dtype](c_out * k + c_out)
-    var a_dst = artefact.unsafe_ptr()
-    if _stage_native_weight(m, c_out, k):
-        var permuted = unsafe_alloc[Scalar[dtype]](c_out * k)
-        _permute_filter_fused_k(permuted, f_src, c_out, c_in, r, s)
-        _crouton_pack_rows(a_dst, permuted, c_out, k)
-        permuted.unsafe_free()
-    else:
-        _permute_filter_fused_k(a_dst, f_src, c_out, c_in, r, s)
-    for j in range(c_out):
-        a_dst[unsafe_offset=c_out * k + j] = Scalar[dtype](0)
-
-    # The row's residual and gn_ab buffers, bound and unread on this arm
-    # (resid_present = 0; the phase-ii fold has not landed). Two distinct
-    # allocations rather than one aliased pointer: the wire binds them as
-    # two buffers, and the dispatch's own argument checking says so.
-    var inert_r = ctx.enqueue_create_buffer[dtype](HMX_TILE)
-    var inert_r_ptr = inert_r.unsafe_ptr()
-    var inert_g = ctx.enqueue_create_buffer[dtype](HMX_TILE)
-    var inert_g_ptr = inert_g.unsafe_ptr()
-    for j in range(HMX_TILE):
-        inert_r_ptr[unsafe_offset=j] = Scalar[dtype](0)
-        inert_g_ptr[unsafe_offset=j] = Scalar[dtype](0)
-
-    var f = ctx.load_function[npu_selector_sig](
-        function_name=String("conv_im2col_hmx_ep"), asm=String("")
-    )
-    for b in range(batch):
-        var witness_ptr = _witness_slot(ctx)
-        _arm_matmul_ran(witness_ptr, op)
-        _arm_unpack_arm_known(witness_ptr, op)
-        ctx.enqueue_function(
-            f,
-            out_base.unsafe_offset(b * m * c_out),
-            small_ptr.unsafe_offset(b * h_small * w_small * c_in),
-            a_dst,
-            witness_ptr,
-            inert_r_ptr,
-            inert_g_ptr,
-            Int32(h_small),
-            Int32(w_small),
-            Int32(c_in),
-            Int32(c_out),
-            Int32(r),
-            Int32(s),
-            Int32(pad_top),
-            Int32(pad_left),
-            Int32(h_out),
-            Int32(w_out),
-            Int32(0),
-            Int32(1),
-            grid_dim=Dim(NPU_GRID_CORES),
-            block_dim=Dim(NPU_THREAD_MASK),
-        )
-    _ = artefact^
-    _ = inert_r^
-    _ = inert_g^
-
-
-@extensibility.register("npu_upsample_conv", type="npu")
-struct UpsampleConv:
-    """Claims the `npu_upsample_conv` custom op the VAE authoring folds a
-    recognized `interpolate_2d_nearest -> conv` pair into
-    (`vae_flux2._maybe_fold_npu_upsample_conv`, behind
-    `MODULAR_NPU_UPSAMPLE_FOLD=1`), and dispatches signed selector 45 with
-    `upsample_log2 = 1` over the pre-upsample map.
-
-    The graph half of the phase-iii fold: the eager recognizer under the
-    same knob proves and certifies the kernel arm but runs AFTER the
-    upsample's materialization walks already executed, because the op
-    stream cannot see consumers. The composite is staged only where the
-    graph could prove them, so here the input IS the small map and the
-    walks never staged. Stride and dilation are structurally 1: the
-    recognizer only folds the stride-1 wrap `Conv2d(permute=True)` authors,
-    so the op carries no stride operand at all.
-
-    `api` is deliberately a wildcard, `RMSNormRope`'s window-285 rule: an
-    op minted by `ops.custom` at graph build is checked against device info
-    the compile does not hold yet, so an `api="npu"` pin can never match
-    there. Pinning `type` keeps cpu/gpu targets refused, and the name is
-    unique across the plugin packages.
-
-    Everything the eager arm declines on is a RAISE here, not a fallback:
-    once the composite staged, the materialization ops are gone, so a
-    dispatch that cannot run the array has nothing to degrade to -- a
-    mint/serve knob skew or an ineligible shape must fail loudly at the
-    first dispatch rather than compute anything else.
-    """
-
-    @staticmethod
-    def execute[
-        dtype: DType,
-        rank: Int,
-        //,
-        pad_top: Int,
-        pad_bottom: Int,
-        pad_left: Int,
-        pad_right: Int,
-        target: StaticString,
-    ](
-        output: OutputTensor[dtype=dtype, rank=rank, ...],
-        input: InputTensor[dtype=dtype, rank=rank, ...],
-        filter: InputTensor[dtype=dtype, rank=rank, ...],
-        ctx: DeviceContext,
-    ) capturing raises:
-        comptime assert dtype == DType.float16, (
-            "npu_upsample_conv on the on-device NPU: fp16 only -- selector"
-            " 45's upsample arm exists for the production f16 row"
-        )
-        comptime assert rank == 4, (
-            "npu_upsample_conv on the on-device NPU: NHWC map and FCRS"
-            " filter are rank 4"
-        )
-
-        if not _upsample_fold_requested():
-            raise Error(
-                "npu_upsample_conv: this MEF was staged with"
-                " MODULAR_NPU_UPSAMPLE_FOLD=1 but the serve does not arm"
-                " it; the fold's staging and its dispatch are one knob"
-            )
-        if not _conv_hmx_requested():
-            raise Error(
-                "npu_upsample_conv: selector 45 runs on the array only;"
-                " arm MODULAR_NPU_CONV_HMX=1 -- the composite has no HVX"
-                " fallback by construction"
-            )
-
-        _require_dense(
-            output.shape(), output.strides(), "npu_upsample_conv", "the output"
-        )
-        _require_dense(
-            input.shape(), input.strides(), "npu_upsample_conv", "the input"
-        )
-        _require_dense(
-            filter.shape(), filter.strides(), "npu_upsample_conv", "the filter"
-        )
-
-        var batch = Int(input.dim_size(0))
-        var h_small = Int(input.dim_size(1))
-        var w_small = Int(input.dim_size(2))
-        var c_in = Int(input.dim_size(3))
-        var c_out = Int(filter.dim_size(0))
-        var r = Int(filter.dim_size(2))
-        var s = Int(filter.dim_size(3))
-        var h_out = Int(output.dim_size(1))
-        var w_out = Int(output.dim_size(2))
-
-        if Int(filter.dim_size(1)) != c_in:
-            raise Error(
-                "npu_upsample_conv: the filter's C extent must be the"
-                " input's channel count"
-            )
-        if (
-            Int(output.dim_size(0)) != batch
-            or Int(output.dim_size(3)) != c_out
-            or h_out != 2 * h_small + pad_top + pad_bottom - (r - 1)
-            or w_out != 2 * w_small + pad_left + pad_right - (s - 1)
-        ):
-            raise Error(
-                "npu_upsample_conv: output extents do not match a stride-1"
-                " convolution of the 2x-upsampled input"
-            )
-
-        var m = h_out * w_out
-        var k = c_in * r * s
-        if not _fused_conv_supported(c_in):
-            raise Error(
-                (
-                    "npu_upsample_conv: the fused gather needs C_in % 64 == 0;"
-                    " the staging recognizer should never have folded C_in "
-                ),
-                c_in,
-            )
-        if not matmul_bt_hmx_accepts(m, c_out, k, 0, c_out):
-            raise Error(
-                "npu_upsample_conv: the array refuses this shape"
-                " (matmul_bt_hmx_accepts); the staging recognizer and this"
-                " dispatch disagree on the admission"
-            )
-
-        _launch_upsample_conv_ep(
-            output.unsafe_ptr(),
-            input.unsafe_ptr(),
-            filter.unsafe_ptr(),
-            batch,
-            h_small,
-            w_small,
-            c_in,
-            c_out,
-            r,
-            s,
-            pad_top,
-            pad_left,
-            h_out,
-            w_out,
-            m,
-            k,
-            "npu_upsample_conv",
-            ctx,
-        )
 
 
 @extensibility.register("mo.conv", type="npu", api="npu")
@@ -5741,13 +3693,9 @@ struct Conv:
     is not defined for.
 
     TODO(skye): the fused arm still permutes the FCRS filter into the gather's
-    `(r, s, c)` k order per dispatch, and the selector-40 route on an
-    array-native serve adds the crouton repack as a second same-size pass.
-    Order 318 measured the recorder's per-launch prep at 0.02-0.04 ms/call on
-    BOTH selectors -- four orders of magnitude under a `C_out * K` host pass
-    -- so the staging is not being paid per dispatch as written and a
-    weight-load hoist has no measurable prize; where the runtime actually
-    absorbs it is not established. Re-price before hoisting anything.
+    `(r, s, c)` k order per dispatch. That copy is `C_out * K` fp16, the same
+    size as the zero-padded stage it replaced, and belongs at weight load once
+    phase 2 owns the weights.
     """
 
     @staticmethod
@@ -5767,9 +3715,6 @@ struct Conv:
         num_groups: Scalar,
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         comptime assert (
             output.dtype == DType.float16 and input.dtype == DType.float16
         ), "mo.conv on the on-device NPU: fp16 only"
@@ -5793,10 +3738,7 @@ struct Conv:
                 Int(num_groups),
             )
         for i in range(Int(strides.size())):
-            if (
-                Int(strides._ptr[unsafe_offset=i]) != 1
-                or Int(dilation._ptr[unsafe_offset=i]) != 1
-            ):
+            if Int(strides._ptr[i]) != 1 or Int(dilation._ptr[i]) != 1:
                 raise Error(
                     "mo.conv on the on-device NPU: stride and dilation must"
                     " be 1 (the decoder is stride-1 by design)"
@@ -5817,8 +3759,8 @@ struct Conv:
         var c_out = Int(filter.dim_size(0))
         var r = Int(filter.dim_size(2))
         var s = Int(filter.dim_size(3))
-        var pad_top = Int(paddings._ptr[unsafe_offset=0])
-        var pad_left = Int(paddings._ptr[unsafe_offset=2])
+        var pad_top = Int(paddings._ptr[0])
+        var pad_left = Int(paddings._ptr[2])
         var h_out = Int(output.dim_size(1))
         var w_out = Int(output.dim_size(2))
 
@@ -5830,10 +3772,8 @@ struct Conv:
         if (
             Int(output.dim_size(0)) != batch
             or Int(output.dim_size(3)) != c_out
-            or h_out
-            != h_in + pad_top + Int(paddings._ptr[unsafe_offset=1]) - (r - 1)
-            or w_out
-            != w_in + pad_left + Int(paddings._ptr[unsafe_offset=3]) - (s - 1)
+            or h_out != h_in + pad_top + Int(paddings._ptr[1]) - (r - 1)
+            or w_out != w_in + pad_left + Int(paddings._ptr[3]) - (s - 1)
         ):
             raise Error(
                 "mo.conv on the on-device NPU: output extents do not match a"
@@ -5859,98 +3799,41 @@ struct Conv:
         # size as the zero-padded copy the materialising arm already stages per
         # dispatch, and belongs at weight load once phase 2 owns the weights.
         if _fused_conv_supported(c_in):
-            # The upsample fold first: a conv whose input was recognized as
-            # the reshape x broadcast-ones nearest-2x (design phase iii)
-            # dispatches selector 45 with `upsample_log2 = 1` over the small
-            # map, when the serve asked (`MODULAR_NPU_UPSAMPLE_FOLD=1`) and
-            # the array admits the shape. Everything it declines continues
-            # below exactly as before.
-            if _upsample_fold_dispatch(
-                output.unsafe_ptr(),
-                input.unsafe_ptr(),
-                filter.unsafe_ptr(),
-                batch,
-                h_in,
-                w_in,
-                c_in,
-                c_out,
-                r,
-                s,
-                pad_top,
-                pad_left,
-                h_out,
-                w_out,
-                m,
-                k,
-                ctx,
-            ):
-                return
-            # Selector 40 is dispatched only for shapes the array will RUN.
-            # The kernel's own gate is `geom.usable() and
-            # matmul_bt_hmx_accepts` (`npu_kernel.mojo:3495`; `usable` is
-            # vacuous on this path -- `c_in % 64 == 0` implies the channel
-            # bound and every other refusing extent zeroes the payload), and
-            # a shape it declines falls to the HVX nest INSIDE the kernel --
-            # where witness word 7 still holds the launch's fifth thread's
-            # `_qurt_thread_id()` from the conv entries' UNBOUNDED stamp
-            # (`npu_kernel.mojo:3486`; the matmul entry bounds the same stamp
-            # to compute threads for exactly this collision, `:3207-3216`,
-            # P5 M2.4). A declined dispatch therefore cannot present a
-            # readable witness on the signed skels, so the decline happens
-            # HERE, at routing (order 318: `conv_out`, c_out = 3, left word 7
-            # = 0x1081AA7 / 0x1901AA7 across the two skels -- a thread id,
-            # not a code), and a declined conv keeps selector 36, today's
-            # exact path. Bounding the conv entries' stamp like matmul's is
-            # queued for the next re-sign window.
-            var conv_hmx = _conv_hmx_requested() and matmul_bt_hmx_accepts(
-                m, c_out, k, 0, c_out
-            )
             var filter_rsc = ctx.enqueue_create_buffer[output.dtype](c_out * k)
             var f_dst = filter_rsc.unsafe_ptr()
             var f_src = filter.unsafe_ptr()
-            # Selector 40 reads B per the SKEL's weight layout with no layout
-            # argument on the wire (mismatch class #366), so a routed
-            # dispatch stages croutons exactly when the serve declares the
-            # array-native skel: `_stage_native_weight` composes that
-            # declaration with the same `matmul_bt_hmx_accepts` the routing
-            # above and the kernel both test -- one predicate, three readers,
-            # no seam for disagreement.
-            if conv_hmx and _stage_native_weight(m, c_out, k):
-                var permuted = unsafe_alloc[Scalar[output.dtype]](c_out * k)
-                _permute_filter_fused_k(permuted, f_src, c_out, c_in, r, s)
-                _crouton_pack_rows(f_dst, permuted, c_out, k)
-                permuted.unsafe_free()
-            else:
-                _permute_filter_fused_k(f_dst, f_src, c_out, c_in, r, s)
+            for n in range(c_out):
+                for cc in range(c_in):
+                    for rr in range(r):
+                        for ss in range(s):
+                            f_dst[n * k + (rr * s + ss) * c_in + cc] = f_src[
+                                ((n * c_in + cc) * r + rr) * s + ss
+                            ]
 
-            # `conv_im2col_hmx` (selector 40) takes the IDENTICAL buffers and
-            # scalars and calls `_matmul_stripe_hmx`, inheriting every code
-            # `_arm_matmul_ran` exists to catch -- family-2 refusals written
-            # beside a successful return (`WITNESS_GUARD_CLASSIFICATION.md`
-            # row 15's latent case). So the array selector is dispatched only
-            # with the correctness guard armed per launch, exactly as the
-            # materialising arm below arms its matmul. Selector 36 keeps the
-            # bare slot: the pure-HVX body has no refusal to miss, and a
-            # guard that cannot fail is not a control.
-            var selector = String("conv_im2col")
-            if conv_hmx:
-                selector = String("conv_im2col_hmx")
+            # REPOINTING THIS ARM AT SELECTOR 40 INHERITS FAMILY-2 REFUSAL
+            # CODES WITH NO GUARD. `conv_im2col` is selector 36,
+            # `mojo_conv_im2col_f16`, the pure-HVX body: it has no path that
+            # writes a witness refusal code and returns success, which is why
+            # this arm passes a slot and arms nothing. `conv_im2col_hmx`
+            # (selector 40) takes the IDENTICAL buffers and scalars and calls
+            # `_matmul_stripe_hmx`, inheriting every code `_arm_matmul_ran`
+            # exists to catch -- so swapping the name here would read as a
+            # perf change and silently hand the graph whatever the output
+            # allocation held. Arm the correctness guard the materialising arm
+            # below arms, and read
+            # `.agentwork/flux-npu/WITNESS_GUARD_CLASSIFICATION.md` first.
             var conv_f = ctx.load_function[npu_selector_sig](
-                function_name=selector, asm=String("")
+                function_name=String("conv_im2col"), asm=String("")
             )
             var in_base = input.unsafe_ptr()
             var out_base = output.unsafe_ptr()
             for b in range(batch):
-                var witness_ptr = _witness_slot(ctx)
-                if conv_hmx:
-                    _arm_matmul_ran(witness_ptr, "mo.conv")
-                    _arm_unpack_arm_known(witness_ptr, "mo.conv")
                 ctx.enqueue_function(
                     conv_f,
-                    out_base.unsafe_offset(b * m * c_out),
-                    in_base.unsafe_offset(b * h_in * w_in * c_in),
+                    out_base + b * m * c_out,
+                    in_base + b * h_in * w_in * c_in,
                     f_dst,
-                    witness_ptr,
+                    _witness_slot(ctx),
                     Int32(h_in),
                     Int32(w_in),
                     Int32(c_in),
@@ -5985,11 +3868,13 @@ struct Conv:
             c_out * k_pad
         )
         var weights = padded_filter.unsafe_ptr()
-        # The FCRS filter's own flatten IS the im2col's contraction order, so
-        # row-per-row staging with a zero K tail is the whole adaptation --
-        # plus the crouton repack on an array-native serve, which this arm
-        # owes the selector exactly as the k-pad matmul path does.
-        _stage_weight_rows(weights, filter.unsafe_ptr(), c_out, k, k_pad, m)
+        var checkpoint = filter.unsafe_ptr()
+        for n in range(c_out):
+            unsafe_memcpy(
+                dest=weights + n * k_pad, src=checkpoint + n * k, count=k
+            )
+            for j in range(k, k_pad):
+                weights[n * k_pad + j] = 0
 
         var f = ctx.load_function[npu_selector_sig](
             function_name=String("matmul"), asm=String("")
@@ -5998,10 +3883,10 @@ struct Conv:
         var src = input.unsafe_ptr()
         var dst_base = output.unsafe_ptr()
         for b in range(batch):
-            var plane = src.unsafe_offset(b * h_in * w_in * c_in)
+            var plane = src + b * h_in * w_in * c_in
             for y in range(h_out):
                 for x in range(w_out):
-                    var row = a.unsafe_offset((y * w_out + x) * k_pad)
+                    var row = a + (y * w_out + x) * k_pad
                     for c in range(c_in):
                         for rr in range(r):
                             var yy = y + rr - pad_top
@@ -6014,13 +3899,10 @@ struct Conv:
                                     and xx >= 0
                                     and xx < w_in
                                 ):
-                                    tap = plane[
-                                        unsafe_offset=(yy * w_in + xx) * c_in
-                                        + c
-                                    ]
-                                row[unsafe_offset=(c * r + rr) * s + ss] = tap
+                                    tap = plane[(yy * w_in + xx) * c_in + c]
+                                row[(c * r + rr) * s + ss] = tap
                     for j in range(k, k_pad):
-                        row[unsafe_offset=j] = 0
+                        row[j] = 0
             # One `a` scratch still serves every batch index in sequence, on the
             # rationale batching removes: an invocation on this transport
             # completes before it returns. The witness no longer relies on that
@@ -6032,7 +3914,7 @@ struct Conv:
             _arm_matmul_ran(witness_ptr, "mo.conv")
             ctx.enqueue_function(
                 f,
-                dst_base.unsafe_offset(b * m * c_out),
+                dst_base + b * m * c_out,
                 a,
                 weights,
                 witness_ptr,
@@ -6103,9 +3985,6 @@ struct SinusoidEmbed:
         neg_ln_max_period: Float32,
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         var num_rows = Int(output.dim_size(0))
         var cols = Int(output.dim_size(1))
         if Int(t.dim_size(0)) != num_rows:
@@ -6144,7 +4023,7 @@ struct SinusoidEmbed:
         var t_ptr = t.unsafe_ptr()
         var largest = Float64(0)
         for b in range(num_rows):
-            var a = Float64(t_ptr[unsafe_offset=b]) * Float64(time_scale)
+            var a = Float64(t_ptr[b]) * Float64(time_scale)
             if a < 0:
                 a = -a
             if a > largest:
@@ -6195,9 +4074,6 @@ struct RopeTable:
         freqs: InputTensor[dtype=DType.float32, rank=1, ...],
         ctx: DeviceContext,
     ) capturing raises:
-        # A held matmul-chain member must run before this op touches any
-        # operand: this is the 186A host-reader class, closed per site.
-        _matmul_chain_flush()
         var num_rows = Int(output.dim_size(0))
         var cols = Int(output.dim_size(1))
         var half_dim = Int(freqs.dim_size(0))
@@ -6256,14 +4132,14 @@ struct RopeTable:
         var freqs_ptr = freqs.unsafe_ptr()
         var largest_pos = Float64(0)
         for s in range(num_rows):
-            var p = Float64(pos_ptr[unsafe_offset=s * pos_stride])
+            var p = Float64(pos_ptr[s * pos_stride])
             if p < 0:
                 p = -p
             if p > largest_pos:
                 largest_pos = p
         var largest_freq = Float64(0)
         for k in range(half_dim):
-            var q = Float64(freqs_ptr[unsafe_offset=k])
+            var q = Float64(freqs_ptr[k])
             if q < 0:
                 q = -q
             if q > largest_freq:

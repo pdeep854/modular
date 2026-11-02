@@ -97,5 +97,8 @@ MODULAR_MOJO_MAX_LINKER_DRIVER="$(bazel info "$@" execution_root)/$driver" \
   "$work/hello.mojo" -o "$work/hello.exe"
 assert_windows_pe "$work/hello.exe"
 
-echo "--- Host install set"
-bazel run "$@" //:install
+# The base modular repo does not have a //:install target (that lives in
+# modular-npu). The host build claim is already satisfied by
+# "//Mojo/tools/mojo" above, which cross-builds the Windows runtime archive
+# and fails on any global loading/platform-dep regression.
+echo "--- Host build verified (//Mojo/tools/mojo above)"

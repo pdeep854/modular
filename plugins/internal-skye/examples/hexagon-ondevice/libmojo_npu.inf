@@ -1,0 +1,27 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = libmojo_npu.cat
+DriverVer   = 07/28/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+libmojo_npu_skel.so = 1
+
+[DefaultInstall]
+CopyFiles = MojoSkel.Copy
+
+[MojoSkel.Copy]
+libmojo_npu_skel.so
+
+[Strings]
+ProviderName = "Modular"
+DiskName     = "Mojo NPU Skel"

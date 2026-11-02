@@ -114,24 +114,6 @@ comptime NPU_UNPACK_ARM_PAIRED: UInt32 = 4
 # the reader crosses first, per PAIRED's rule above.
 comptime NPU_UNPACK_ARM_NATIVE: UInt32 = 5
 
-# BIAS / BIAS_RESID are the conv epilogue readouts (`conv_im2col_hmx_ep`, the
-# re-sign-window sibling of selector 40): the unpack added the artefact's
-# per-channel bias tail, and RESID also accumulated the row's fifth buffer.
-# Reader crosses first, per PAIRED's rule above; the writer rides the same
-# re-sign window as the row.
-comptime NPU_UNPACK_ARM_BIAS: UInt32 = 6
-comptime NPU_UNPACK_ARM_BIAS_RESID: UInt32 = 7
-
-# The relayout row's path word (`relayout_kernel.mojo`, selector 47): the same
-# word 7 the matmul family reports through, with the row's own two-code
-# vocabulary. RAN means the walk covered the declared extents; REFUSED means a
-# non-positive extent and NOTHING WRITTEN, so the guard that reads it is
-# CORRECTNESS -- an output the kernel never produced must fail the flush, not
-# feed the next op. This side is a reader; the codes belong to the signed row.
-comptime NPU_WITNESS_RELAYOUT_PATH: Int = 7
-comptime NPU_RELAYOUT_PATH_RAN: UInt32 = 1
-comptime NPU_RELAYOUT_PATH_REFUSED: UInt32 = 2
-
 
 # ===----------------------------------------------------------------------=== #
 # The witness arena — one process-lifetime allocation, one slot per in-flight
