@@ -2666,9 +2666,7 @@ struct DeviceFunction[
     declared_arg_types: TypeList[Trait=AnyType, ...],
     *,
     target: _TargetType = get_gpu_target(),
-    compile_options: StaticString = CompilationTarget[
-        target
-    ].default_compile_options(),
+    compile_options: StaticString = "",
     link_options: StaticString = "",
     _ptxas_info_verbose: Bool = False,
 ](ImplicitlyCopyable):
@@ -4567,12 +4565,11 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
             location=location.or_else(call_location()),
         )
 
-    @parameter
     @always_inline
     def enqueue_function[
         declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: def(* args: * declared_arg_types) capturing -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *actual_arg_types: DevicePassable,
         link_options: StaticString = "",
         dump_asm: _DumpPath = False,

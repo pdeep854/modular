@@ -277,12 +277,11 @@ __extension DeviceContext:
     def _check_supports_default_compile_function(self):
         pass
 
-    @parameter
     @always_inline
     def enqueue_function[
         declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: def(* args: * declared_arg_types) thin -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *actual_arg_types: DevicePassable,
         link_options: StaticString = "",
         dump_asm: _DumpPath = False,
@@ -405,7 +404,6 @@ __extension DeviceContext:
             location=location.or_else(call_location()),
         )
 
-    @parameter
     @always_inline
     def enqueue_function[
         *Ts: DevicePassable

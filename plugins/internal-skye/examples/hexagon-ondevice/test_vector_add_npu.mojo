@@ -245,7 +245,7 @@ def run_vadd(ctx: DeviceContext) raises -> Bool:
     var ok = True
     var sizes: List[Int] = [32, 64, 100, 256]
     for n in sizes:
-        if not run_vadd_size(ctx, n[]):
+        if not run_vadd_size(ctx, n):
             ok = False
     return ok
 
