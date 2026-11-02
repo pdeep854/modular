@@ -2305,7 +2305,7 @@ struct DeviceStream(ImplicitlyCopyable, _FunctionEnqueuer):
     @always_inline
     def enqueue_host_func(
         self,
-        func: def(OpaquePointer[MutAnyOrigin]) thin -> None,
+        func: def(OpaquePointer[MutAnyOrigin]) -> None,
         user_data: OpaquePointer[MutAnyOrigin],
     ) raises:
         """Enqueues a host callback to run on this stream.
@@ -2706,7 +2706,7 @@ struct DeviceFunction[
     var _handle: _DeviceFunctionPtr[mut=True]
     """Internal handle to the compiled device function."""
 
-    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, Self.target]
+    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, CompilationTarget[Self.target]]
     """Compilation information for the function."""
 
     var _context: DeviceContext
@@ -2805,7 +2805,7 @@ struct DeviceFunction[
             return val.unsafe_get[StaticString]() != "", val
 
         else:
-            return val.isa[def() capturing -> Path](), val
+            return False, val
 
     @staticmethod
     def _cleanup_asm(s: StringSlice) -> String:
@@ -2883,12 +2883,7 @@ struct DeviceFunction[
         comptime if do_dump_asm:
             var asm = self._cleanup_asm(get_asm())
 
-            comptime if dump_asm_val.isa[def() capturing -> Path]():
-                comptime dump_asm_fn = dump_asm_val.unsafe_get[
-                    def() capturing -> Path
-                ]()
-                dump_asm_fn().write_text(asm)
-            elif dump_asm_val.isa[Path]():
+            comptime if dump_asm_val.isa[Path]():
                 self._expand_path(dump_asm_val.unsafe_get[Path]()).write_text(
                     asm
                 )
@@ -2907,12 +2902,7 @@ struct DeviceFunction[
             var ptx = Self._cleanup_asm(get_asm())
             var sass = _to_sass[Self.target](ptx)
 
-            comptime if dump_sass_val.isa[def() capturing -> Path]():
-                comptime _dump_sass_fn = dump_sass_val.unsafe_get[
-                    def() capturing -> Path
-                ]()
-                _dump_sass_fn().write_text(sass)
-            elif dump_sass_val.isa[Path]():
+            comptime if dump_sass_val.isa[Path]():
                 self._expand_path(dump_sass_val.unsafe_get[Path]()).write_text(
                     sass
                 )
@@ -2936,12 +2926,7 @@ struct DeviceFunction[
                 link_options=Self.link_options,
             ]().asm
 
-            comptime if dump_llvm_val.isa[def() capturing -> Path]():
-                comptime dump_llvm_fn = dump_llvm_val.unsafe_get[
-                    def() capturing -> Path
-                ]()
-                dump_llvm_fn().write_text(llvm)
-            elif dump_llvm_val.isa[Path]():
+            comptime if dump_llvm_val.isa[Path]():
                 self._expand_path(dump_llvm_val.unsafe_get[Path]()).write_text(
                     llvm
                 )
@@ -4144,11 +4129,9 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
     def compile_function[
         declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: def(* args: * declared_arg_types) thin -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *,
-        compile_options: StaticString = CompilationTarget[
-            Self.default_device_info.target()
-        ].default_compile_options(),
+        compile_options: StaticString = "",
         link_options: StaticString = "",
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4221,11 +4204,9 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
     def compile_function[
         declared_arg_types: TypeList[Trait=AnyType, ...],
         //,
-        func: def(* args: * declared_arg_types) capturing -> None,
+        func: def(* args: * declared_arg_types) -> None,
         *,
-        compile_options: StaticString = CompilationTarget[
-            Self.default_device_info.target()
-        ].default_compile_options(),
+        compile_options: StaticString = "",
         link_options: StaticString = "",
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4694,7 +4675,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     @always_inline
     def enqueue_cpu_function[
-        func: def() capturing -> None,
+        func: def() -> None,
     ](self) raises:
         """Enqueues a function for execution on CPU.
 
