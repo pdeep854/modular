@@ -2652,7 +2652,7 @@ struct DeviceEvent(ImplicitlyCopyable):
 
 
 def _is_nvidia_gpu[target: _TargetType]() -> Bool:
-    return is_triple["nvptx64-nvidia-cuda", target]()
+    return is_triple["nvptx64-nvidia-cuda", CompilationTarget[_mlir_value=target]]()
 
 
 def _is_path_like(ss: StringSlice) -> Bool:
@@ -2703,10 +2703,11 @@ struct DeviceFunction[
     comptime _emission_kind = "asm" if (
         _cross_compilation() and _is_nvidia_gpu[Self.target]()
     ) else "object"
+    comptime _ct_target = CompilationTarget[_mlir_value=Self.target]
     var _handle: _DeviceFunctionPtr[mut=True]
     """Internal handle to the compiled device function."""
 
-    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, CompilationTarget[Self.target]]
+    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, Self._ct_target]
     """Compilation information for the function."""
 
     var _context: DeviceContext
