@@ -10,38 +10,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Minimal DeviceContext/Dim stubs for NPU testing on Mojo 1.3.0.dev0.
+"""Minimal DeviceContext stub for NPU testing on Mojo 1.3.0.dev0.
 
-Provides only the API surface used by the NPU integration tests:
-  DeviceContext(api="npu"), HostBuffer, DeviceBuffer, DeviceExternalFunction,
-  Dim, enqueue_create_host_buffer, enqueue_create_buffer, enqueue_copy_from,
-  enqueue_copy_to, synchronize, load_function, enqueue_function.
-
-All other DeviceContext functionality (GPU kernels, CUDA, HIP, Metal) is
-deliberately absent here; use the full device_context.mojo for that.
+Provides: DeviceContext, HostBuffer, DeviceBuffer, DeviceExternalFunction, Dim.
+Only the subset of the API used by the hexagon on-device NPU tests is here.
 """
 
-from memory import UnsafePointer
-from sys import external_call, sizeof
-from sys.ffi import OpaquePointer
-
-
-# ---------------------------------------------------------------------------
-# Opaque C-runtime handle types
-# ---------------------------------------------------------------------------
-
-alias _CtxPtr = OpaquePointer
-alias _FuncPtr = OpaquePointer
-
-
-def _cstr(s: String) -> UnsafePointer[UInt8]:
-    return s.unsafe_ptr()
-
-
-def _checked(err: UnsafePointer[UInt8]) raises:
-    if not err:
-        return
-    raise Error(String(StringRef(err)))
+from std.collections import InlineArray
+from std.ffi import external_call, c_uint
+from std.memory import Pointer
+from std.sys import size_of
 
 
 # ---------------------------------------------------------------------------
@@ -50,47 +28,58 @@ def _checked(err: UnsafePointer[UInt8]) raises:
 
 
 struct Dim(Copyable):
-    """Grid / block dimension (1-D, 2-D, or 3-D)."""
+    """Grid or block dimension (one, two, or three axes)."""
 
-    var _x: Int32
-    var _y: Int32
-    var _z: Int32
+    var _x: Int
+    var _y: Int
+    var _z: Int
 
     def __init__(out self, x: Int):
-        self._x = Int32(x)
-        self._y = Int32(1)
-        self._z = Int32(1)
+        self._x = x
+        self._y = 1
+        self._z = 1
 
     def __init__(out self, x: Int, y: Int):
-        self._x = Int32(x)
-        self._y = Int32(y)
-        self._z = Int32(1)
+        self._x = x
+        self._y = y
+        self._z = 1
 
     def __init__(out self, x: Int, y: Int, z: Int):
-        self._x = Int32(x)
-        self._y = Int32(y)
-        self._z = Int32(z)
+        self._x = x
+        self._y = y
+        self._z = z
 
-    def x(self) -> Int32:
+    def x(self) -> Int:
         return self._x
 
-    def y(self) -> Int32:
+    def y(self) -> Int:
         return self._y
 
-    def z(self) -> Int32:
+    def z(self) -> Int:
         return self._z
 
 
 # ---------------------------------------------------------------------------
-# HostBuffer — pinned host memory accessible by both host and NPU
+# HostBuffer
 # ---------------------------------------------------------------------------
 
 
-struct HostBuffer[dtype: DType]:
-    var _ptr: UnsafePointer[Scalar[dtype]]
+struct HostBuffer[dtype: DType](Copyable):
+    """Host-accessible buffer.
+
+    On Hexagon/CDSP the host and device share physical memory, so the same
+    allocation serves both `enqueue_create_host_buffer` and
+    `enqueue_create_buffer`.
+    """
+
+    var _ptr: UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin]
     var _n: Int
 
-    def __init__(out self, ptr: UnsafePointer[Scalar[dtype]], n: Int):
+    def __init__(
+        out self,
+        ptr: UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin],
+        n: Int,
+    ):
         self._ptr = ptr
         self._n = n
 
@@ -100,31 +89,42 @@ struct HostBuffer[dtype: DType]:
     def __setitem__(mut self, i: Int, v: Scalar[dtype]):
         self._ptr[i] = v
 
-    def unsafe_ptr(self) -> UnsafePointer[Scalar[dtype]]:
+    def unsafe_ptr(self) -> UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin]:
         return self._ptr
 
 
 # ---------------------------------------------------------------------------
-# DeviceBuffer — on-device memory
+# DeviceBuffer
 # ---------------------------------------------------------------------------
 
 
-struct DeviceBuffer[dtype: DType]:
-    var _ptr: UnsafePointer[Scalar[dtype]]
+struct DeviceBuffer[dtype: DType](Copyable):
+    """On-device buffer.
+
+    On Hexagon/CDSP host and device share physical memory; the copy methods
+    are no-ops and `unsafe_ptr` returns the same allocation used by the paired
+    `HostBuffer`.
+    """
+
+    var _ptr: UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin]
     var _n: Int
 
-    def __init__(out self, ptr: UnsafePointer[Scalar[dtype]], n: Int):
+    def __init__(
+        out self,
+        ptr: UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin],
+        n: Int,
+    ):
         self._ptr = ptr
         self._n = n
 
-    def unsafe_ptr(self) -> UnsafePointer[Scalar[dtype]]:
+    def unsafe_ptr(self) -> UnsafePointer[Scalar[dtype], MutUnsafeAnyOrigin]:
         return self._ptr
 
     def enqueue_copy_from(self, src: HostBuffer[dtype]):
-        pass  # no-op: on NPU, host and device share memory
+        pass  # Hexagon: shared physical memory — copy is a no-op
 
     def enqueue_copy_to(self, mut dst: HostBuffer[dtype]):
-        pass  # no-op: on NPU, host and device share memory
+        pass  # Hexagon: shared physical memory — copy is a no-op
 
 
 # ---------------------------------------------------------------------------
@@ -132,161 +132,191 @@ struct DeviceBuffer[dtype: DType]:
 # ---------------------------------------------------------------------------
 
 
-struct DeviceExternalFunction:
-    var _handle: _FuncPtr
+struct DeviceExternalFunction(Copyable):
+    """Handle to a kernel resolved by name via AsyncRT loadFunction."""
 
-    def __init__(out self, handle: _FuncPtr):
+    var _handle: UnsafePointer[NoneType, MutUnsafeAnyOrigin]
+
+    def __init__(
+        out self, handle: UnsafePointer[NoneType, MutUnsafeAnyOrigin]
+    ):
         self._handle = handle
 
 
 # ---------------------------------------------------------------------------
-# DeviceContext — wraps AsyncRT_DeviceContext
+# DeviceContext
 # ---------------------------------------------------------------------------
 
 
-struct DeviceContext:
-    var _handle: _CtxPtr
+struct DeviceContext(Copyable):
+    """Host-side handle to the NPU (Hexagon CDSP) via AsyncRT."""
 
-    def __init__(out self, device_id: Int = 0, *, var api: String = "npu") raises:
-        var result: _CtxPtr = _CtxPtr()
-        var api_cstr = api.unsafe_ptr()
-        _checked(
-            external_call[
-                "AsyncRT_DeviceContext_create",
-                UnsafePointer[UInt8],
-                UnsafePointer[_CtxPtr],
-                UnsafePointer[UInt8],
-                Int32,
-            ](
-                UnsafePointer(to=result),
-                api_cstr,
-                Int32(device_id),
-            )
+    var _handle: UnsafePointer[NoneType, MutUnsafeAnyOrigin]
+
+    def __init__(out self, *, api: String) raises:
+        """Creates an AsyncRT device context for the given API string.
+
+        Args:
+            api: Backend name, e.g. "npu".
+
+        Raises:
+            Error if AsyncRT_DeviceContext_create returns a non-null error.
+        """
+        var handle = UnsafePointer[NoneType, MutUnsafeAnyOrigin]()
+        var err = external_call[
+            "AsyncRT_DeviceContext_create",
+            UnsafePointer[UInt8, MutUnsafeAnyOrigin],
+        ](
+            UnsafePointer(to=handle),
+            api.unsafe_ptr(),
+            Int32(0),
         )
-        self._handle = result
+        if err:
+            raise Error("AsyncRT_DeviceContext_create failed")
+        self._handle = handle
 
-    def enqueue_create_host_buffer[
-        dtype: DType
-    ](self, n: Int) -> HostBuffer[dtype]:
-        var bytes = n * sizeof[Scalar[dtype]]()
-        var ptr = external_call[
-            "AsyncRT_DeviceContext_allocateHostBuffer",
-            UnsafePointer[Scalar[dtype]],
-            _CtxPtr,
-            Int,
-        ](self._handle, bytes)
+    def enqueue_create_host_buffer[dtype: DType](
+        self, n: Int
+    ) -> HostBuffer[dtype]:
+        """Allocates a host-accessible buffer of `n` elements.
+
+        On Hexagon/CDSP shared memory this allocation is also device-visible.
+
+        Args:
+            n: Number of elements.
+
+        Returns:
+            A `HostBuffer` wrapping the allocation.
+        """
+        var ptr = UnsafePointer[Scalar[dtype]].alloc(n)
         return HostBuffer[dtype](ptr, n)
 
-    def enqueue_create_buffer[
-        dtype: DType
-    ](self, n: Int) -> DeviceBuffer[dtype]:
-        var bytes = n * sizeof[Scalar[dtype]]()
-        var ptr = external_call[
-            "AsyncRT_DeviceContext_allocateBuffer",
-            UnsafePointer[Scalar[dtype]],
-            _CtxPtr,
-            Int,
-        ](self._handle, bytes)
+    def enqueue_create_buffer[dtype: DType](
+        self, n: Int
+    ) -> DeviceBuffer[dtype]:
+        """Allocates a device buffer of `n` elements.
+
+        On Hexagon/CDSP shared memory this allocation is also host-visible.
+
+        Args:
+            n: Number of elements.
+
+        Returns:
+            A `DeviceBuffer` wrapping the allocation.
+        """
+        var ptr = UnsafePointer[Scalar[dtype]].alloc(n)
         return DeviceBuffer[dtype](ptr, n)
 
     def synchronize(self) raises:
-        _checked(
-            external_call[
-                "AsyncRT_DeviceContext_synchronize",
-                UnsafePointer[UInt8],
-                _CtxPtr,
-            ](self._handle)
-        )
+        """Blocks until all enqueued NPU operations complete.
 
-    def load_function[
-        sig: AnyType
-    ](
+        Raises:
+            Error if AsyncRT_DeviceContext_synchronize returns a non-null error.
+        """
+        var err = external_call[
+            "AsyncRT_DeviceContext_synchronize",
+            UnsafePointer[UInt8, MutUnsafeAnyOrigin],
+        ](self._handle)
+        if err:
+            raise Error("AsyncRT_DeviceContext_synchronize failed")
+
+    def load_function[sig: AnyType](
         self,
         *,
         function_name: String,
         asm: String,
     ) raises -> DeviceExternalFunction:
-        var func_result: _FuncPtr = _FuncPtr()
-        var empty = String("")
-        _checked(
-            external_call[
-                "AsyncRT_DeviceContext_loadFunction",
-                UnsafePointer[UInt8],
-                UnsafePointer[_FuncPtr],
-                _CtxPtr,
-                UnsafePointer[UInt8],
-                UnsafePointer[UInt8],
-                UnsafePointer[UInt8],
-                Int,
-                Int32,
-                UnsafePointer[UInt8],
-                Int32,
-            ](
-                UnsafePointer(to=func_result),
-                self._handle,
-                empty.unsafe_ptr(),           # module_name
-                function_name.unsafe_ptr(),   # function_name
-                asm.unsafe_ptr(),             # data
-                Int(asm.byte_length()),       # dataLen
-                Int32(0),                     # maxDynamicSharedBytes
-                empty.unsafe_ptr(),           # debugLevel
-                Int32(3),                     # optimizationLevel
-            )
-        )
-        return DeviceExternalFunction(func_result)
+        """Resolves a kernel by name from NPUKernels.def via AsyncRT.
 
-    def enqueue_function[
-        *Ts: AnyType
-    ](
+        Passing `asm=""` makes the runtime look the name up in its built-in
+        registry rather than JIT-compiling provided assembly.
+
+        Parameters:
+            sig: Unused type parameter; kept for API compatibility.
+
+        Args:
+            function_name: Name of the NPU kernel selector to resolve.
+            asm: Optional assembly bytes; pass `""` for name-only lookup.
+
+        Returns:
+            A `DeviceExternalFunction` wrapping the resolved kernel handle.
+
+        Raises:
+            Error if AsyncRT_DeviceContext_loadFunction returns a non-null error.
+        """
+        var func_handle = UnsafePointer[NoneType, MutUnsafeAnyOrigin]()
+        var empty = String("")
+        var err = external_call[
+            "AsyncRT_DeviceContext_loadFunction",
+            UnsafePointer[UInt8, MutUnsafeAnyOrigin],
+        ](
+            UnsafePointer(to=func_handle),
+            self._handle,
+            empty.unsafe_ptr(),
+            function_name.unsafe_ptr(),
+            asm.unsafe_ptr(),
+            Int(asm.byte_length()),
+            Int32(0),
+            empty.unsafe_ptr(),
+            Int32(3),
+        )
+        if err:
+            raise Error("AsyncRT_DeviceContext_loadFunction failed")
+        return DeviceExternalFunction(func_handle)
+
+    def enqueue_function[*Ts: AnyType](
         self,
         f: DeviceExternalFunction,
         *args: *Ts,
         grid_dim: Dim,
         block_dim: Dim,
     ) raises:
-        # Pack each argument as an OpaquePointer to its value on the stack.
-        var n = __mlir_op.`pop.variadic.size`(args)
-        var ptrs = UnsafePointer[OpaquePointer].alloc(n)
-        # We can't iterate variadic args in a loop in 1.3.0; use a comptime unroll.
+        """Dispatches `f` on the NPU with the given grid/block dimensions.
 
-        @parameter
-        for i in range(n):
-            var arg = args[i]
-            ptrs[i] = OpaquePointer(UnsafePointer(to=arg).bitcast[NoneType]())
+        Each argument is forwarded by address via the FAM protocol:
+        `args[i]` points at the i-th user argument value.
 
-        _checked(
-            external_call[
-                "AsyncRT_DeviceContext_enqueueFunctionDirect",
-                UnsafePointer[UInt8],
-                _CtxPtr,
-                _FuncPtr,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                UInt32,
-                OpaquePointer,
-                UInt32,
-                UnsafePointer[OpaquePointer],
-                UInt32,
-                OpaquePointer,
-            ](
-                self._handle,
-                f._handle,
-                UInt32(grid_dim.x()),
-                UInt32(grid_dim.y()),
-                UInt32(grid_dim.z()),
-                UInt32(block_dim.x()),
-                UInt32(block_dim.y()),
-                UInt32(block_dim.z()),
-                UInt32(0),        # shared_mem_bytes
-                OpaquePointer(),  # attributes (null)
-                UInt32(0),        # num_attributes
-                ptrs,
-                UInt32(n),
-                OpaquePointer(),  # arg_sizes (null)
-            )
+        Parameters:
+            *Ts: Compile-time types of the variadic arguments.
+
+        Args:
+            f: Kernel handle from `load_function`.
+            *args: Arguments forwarded to the kernel.
+            grid_dim: Number of grid cores to launch.
+            block_dim: Thread mask (low bits map to CDSP hardware threads).
+
+        Raises:
+            Error if AsyncRT_DeviceContext_enqueueFunctionDirect fails.
+        """
+        comptime num_args = Ts.length
+        var dense_args = InlineArray[Pointer[NoneType, MutAnyOrigin], num_args](
+            uninitialized=True
         )
-        ptrs.free()
+        comptime for i in range(num_args):
+            dense_args[i] = (
+                Pointer(to=args[i])
+                .unsafe_bitcast[NoneType]()
+                .unsafe_mut_cast[True]()
+                .as_unsafe_any_origin()
+            )
+        var err = external_call[
+            "AsyncRT_DeviceContext_enqueueFunctionDirect",
+            UnsafePointer[UInt8, MutUnsafeAnyOrigin],
+        ](
+            self._handle,
+            f._handle,
+            c_uint(grid_dim._x),
+            c_uint(1),
+            c_uint(1),
+            c_uint(block_dim._x),
+            c_uint(1),
+            c_uint(1),
+            c_uint(0),
+            UnsafePointer[NoneType, MutUnsafeAnyOrigin](),
+            c_uint(0),
+            dense_args.unsafe_ptr(),
+            c_uint(num_args),
+            UnsafePointer[UInt64, MutUnsafeAnyOrigin](),
+        )
+        if err:
+            raise Error("AsyncRT_DeviceContext_enqueueFunctionDirect failed")
