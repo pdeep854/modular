@@ -41,7 +41,7 @@ print(info)
 from std.collections.string.string_span import _get_kgen_string
 from std.os import PathLike
 from std.pathlib import Path
-from std.sys.info import CompilationTarget
+from std.sys.info import CompilationTarget, _TargetType, _current_target
 
 from std.reflection import get_linkage_name
 
@@ -68,7 +68,7 @@ struct _Info(TrivialRegisterPassable):
 struct CompiledFunctionInfo[
     func_type: TrivialRegisterPassable,
     func: func_type,
-    target: CompilationTarget,
+    target: _TargetType = _current_target(),
 ](TrivialRegisterPassable, Writable):
     """Contains compilation information and results for a function.
 
@@ -176,8 +176,8 @@ def compile_info[
     /,
     *,
     emission_kind: StaticString = "asm",
-    target: CompilationTarget = CompilationTarget.current(),
-    compile_options: StaticString = target.default_compile_options(),
+    target: _TargetType = _current_target(),
+    compile_options: StaticString = "",
     link_options: StaticString = "",
 ]() -> CompiledFunctionInfo[func_type, func, target]:
     """Compiles a function and returns detailed compilation information.
@@ -227,7 +227,7 @@ def compile_info[
     """
 
     var offload = __mlir_op.`kgen.compile_offload`[
-        target_type=target._mlir_value,
+        target_type=target,
         emission_kind=_get_emission_kind_id[emission_kind]().__mlir_index__(),
         emission_option=_get_kgen_string[compile_options](),
         emission_link_option=_get_kgen_string[link_options](),
@@ -237,7 +237,7 @@ def compile_info[
 
     return CompiledFunctionInfo[func_type, func, target](
         asm=StaticString(offload.asm),
-        function_name=get_linkage_name[func, target=target](),
+        function_name=get_linkage_name[func, target=CompilationTarget[_mlir_value=target]](),
         module_name=StaticString(offload.module_name),
         emission_kind=emission_kind,
     )

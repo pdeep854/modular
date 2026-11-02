@@ -2703,11 +2703,10 @@ struct DeviceFunction[
     comptime _emission_kind = "asm" if (
         _cross_compilation() and _is_nvidia_gpu[Self.target]()
     ) else "object"
-    comptime _ct_target = CompilationTarget[_mlir_value=Self.target]
     var _handle: _DeviceFunctionPtr[mut=True]
     """Internal handle to the compiled device function."""
 
-    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, Self._ct_target]
+    var _func_impl: CompiledFunctionInfo[Self.func_type, Self.func, Self.target]
     """Compilation information for the function."""
 
     var _context: DeviceContext

@@ -64,9 +64,7 @@ def _compile_code[
     *,
     emission_kind: StaticString = "asm",
     target: _TargetType = get_gpu_target(),
-    compile_options: StaticString = CompilationTarget[
-        target
-    ].default_compile_options(),
+    compile_options: StaticString = "",
     link_options: StaticString = "",
 ]() -> CompiledFunctionInfo[func_type, func, target]:
     return compile_info[
