@@ -222,7 +222,12 @@ struct DeviceContext(Copyable):
         if err:
             raise Error("AsyncRT_DeviceContext_synchronize failed")
 
-    def load_function[sig: TrivialRegisterPassable](
+    def load_function[
+        func_type: TrivialRegisterPassable,
+        //,
+        sig: func_type,
+        /,
+    ](
         self,
         *,
         function_name: String,
