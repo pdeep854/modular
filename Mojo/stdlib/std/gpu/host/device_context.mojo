@@ -197,7 +197,7 @@ comptime _CString[origin: ImmOrigin = ImmUntrackedOrigin] = Optional[
     CStringSlice[origin]
 ]
 
-comptime _DumpPath = Variant[Bool, Path, StaticString, def() -> Path]
+comptime _DumpPath = Variant[Bool, Path, StaticString]
 
 # Define helper methods to call AsyncRT bindings.
 
