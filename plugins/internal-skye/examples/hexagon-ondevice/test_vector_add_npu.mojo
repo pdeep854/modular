@@ -243,8 +243,9 @@ def run_vadd(ctx: DeviceContext) raises -> Bool:
       256 — eight vectors, no tail
     """
     var ok = True
-    for n in (32, 64, 100, 256):
-        if not run_vadd_size(ctx, n):
+    var sizes = List[Int](32, 64, 100, 256)
+    for n in sizes:
+        if not run_vadd_size(ctx, n[]):
             ok = False
     return ok
 

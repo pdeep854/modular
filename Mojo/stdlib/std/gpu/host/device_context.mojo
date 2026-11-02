@@ -39,8 +39,12 @@ from std.ffi import (
     c_size_t,
     external_call,
     CStringSlice,
-    _CPointer,
 )
+from std.memory import OptionalPointer
+
+comptime _CPointer[
+    mut: Bool, //, T: AnyType, origin: Origin[mut=mut]
+] = OptionalPointer[T, origin]
 from std.sys import (
     bit_width_of,
     get_defined_bool,
@@ -193,7 +197,7 @@ comptime _CString[origin: ImmOrigin = ImmUntrackedOrigin] = Optional[
     CStringSlice[origin]
 ]
 
-comptime _DumpPath = Variant[Bool, Path, StaticString, def() capturing -> Path]
+comptime _DumpPath = Variant[Bool, Path, StaticString, def() -> Path]
 
 # Define helper methods to call AsyncRT bindings.
 

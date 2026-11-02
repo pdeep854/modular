@@ -25,10 +25,37 @@ memory specifications, thread organization, and performance characteristics.
 from std.math import ceildiv, floor
 from std.sys.info import (
     CompilationTarget,
-    Vendor,
     _accelerator_arch,
     _TargetType,
 )
+
+
+struct Vendor(Equatable, TrivialRegisterPassable, Writable):
+    var _value: Int8
+
+    comptime NO_GPU = Self(0)
+    comptime AMD_GPU = Self(1)
+    comptime NVIDIA_GPU = Self(2)
+    comptime APPLE_GPU = Self(3)
+
+    def __eq__(self, other: Self) -> Bool:
+        return self._value == other._value
+
+    def __ne__(self, other: Self) -> Bool:
+        return not (self == other)
+
+    @no_inline
+    def write_to(self, mut writer: Some[Writer]):
+        if self == Vendor.NO_GPU:
+            writer.write("no_gpu")
+        elif self == Vendor.AMD_GPU:
+            writer.write("amd")
+        elif self == Vendor.NVIDIA_GPU:
+            writer.write("nvidia")
+        elif self == Vendor.APPLE_GPU:
+            writer.write("apple")
+        else:
+            writer.write("unknown")
 
 comptime _KB = 1024
 comptime _K = 1024
