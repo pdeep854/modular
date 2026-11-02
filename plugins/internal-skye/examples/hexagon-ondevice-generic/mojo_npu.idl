@@ -1,0 +1,54 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+/*
+ * FastRPC interface for the Mojo NPU skel.
+ *
+ * Method numbering (after the implicit open=0 and close=1):
+ *
+ *   method 2  vadd      legacy typed entry point, kept for ABI compatibility
+ *                       with the direct-transport example.
+ *
+ *   method 3  dispatch  generic entry point: one selector selects the kernel,
+ *                       a packed primitive block carries its geometry, and a
+ *                       packed scalar block + eight raw buffer slots carry its
+ *                       arguments.  Wire descriptor: qurtScalars(3, 10, 8)
+ *                       = 0x030A0800.
+ *
+ * Primitive block layout (19 uint32 words, passed as in sequence<uint32>):
+ *   [0]       selector        identifies the Mojo kernel (see NPUKernels.def)
+ *   [1]       launch_word     thread mask in bits [7:0]; timing flags above
+ *   [2]       scalar_bytes    byte length of the scalar_block argument
+ *   [3+2*i]   in_len_i        input byte length of buffer slot i  (0..7)
+ *   [4+2*i]   out_len_i       output byte length of buffer slot i (0..7)
+ *
+ * Scalar block layout (bytes, passed as in sequence<octet>):
+ *   bytes [i*8 .. i*8+7]                one scalar argument padded to 8 bytes
+ *   bytes [(scalarCount+j)*8 .. +7]     uint64 byte offset for buffer slot j
+ *                                       from its slot base pointer
+ *
+ * Buffer slots in0..in7 / out0..out7 carry the same allocations in both
+ * directions; the offset in the scalar block adjusts pointer within the base.
+ * Unused slots carry null / zero length.
+ */
+
+interface mojo_npu : remote_handle64 {
+
+   /* method 2: legacy typed vadd (direct-transport example) */
+   AEEResult vadd(in sequence<float> a, in sequence<float> b,
+                  rout sequence<float> c);
+
+   /* method 3: generic kernel dispatch */
+   AEEResult dispatch(
+       in  sequence<uint32> primitive_block,
+       in  sequence<octet>  scalar_block,
+       in  sequence<octet>  in0,  in  sequence<octet>  in1,
+       in  sequence<octet>  in2,  in  sequence<octet>  in3,
+       in  sequence<octet>  in4,  in  sequence<octet>  in5,
+       in  sequence<octet>  in6,  in  sequence<octet>  in7,
+       rout sequence<octet> out0, rout sequence<octet> out1,
+       rout sequence<octet> out2, rout sequence<octet> out3,
+       rout sequence<octet> out4, rout sequence<octet> out5,
+       rout sequence<octet> out6, rout sequence<octet> out7
+   );
+};

@@ -101,9 +101,9 @@ struct HostBuffer[dtype: DType](Copyable):
 struct DeviceBuffer[dtype: DType](Copyable):
     """On-device buffer.
 
-    On Hexagon/CDSP host and device share physical memory; the copy methods
-    are no-ops and `unsafe_ptr` returns the same allocation used by the paired
-    `HostBuffer`.
+    On Hexagon/CDSP the host and device share the same physical memory, but
+    `enqueue_create_host_buffer` and `enqueue_create_buffer` produce separate
+    allocations, so the copy methods perform an element-wise CPU copy.
     """
 
     var _ptr: Pointer[Scalar[Self.dtype], MutAnyOrigin]
@@ -121,10 +121,14 @@ struct DeviceBuffer[dtype: DType](Copyable):
         return self._ptr
 
     def enqueue_copy_from(self, src: HostBuffer[Self.dtype]):
-        pass  # Hexagon: shared physical memory — copy is a no-op
+        var n = self._n if self._n < src._n else src._n
+        for i in range(n):
+            self._ptr[i] = src._ptr[i]
 
     def enqueue_copy_to(self, mut dst: HostBuffer[Self.dtype]):
-        pass  # Hexagon: shared physical memory — copy is a no-op
+        var n = self._n if self._n < dst._n else dst._n
+        for i in range(n):
+            dst._ptr[i] = self._ptr[i]
 
 
 # ---------------------------------------------------------------------------

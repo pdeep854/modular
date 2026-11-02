@@ -160,13 +160,58 @@ ErrorOr<QuRTDriver> bindDriver() {
   }
 
 #ifndef _WIN32
-  // The on-device NPU is reached through the OS's own FastRPC library. Nothing
-  // stops a POSIX port beyond a second name-resolution path, but the milestone
-  // this backend exists for is Windows on ARM64.
+  // Linux BSP path: search for the Compute DSP FastRPC library in standard
+  // locations.  The BSP provides this as libcdsprpc.so (or a similarly named
+  // library); the search order is:
+  //   1. ${ADSP_LIBRARY_PATH}/libcdsprpc.so — the BSP's documented override
+  //   2. /vendor/lib64/libcdsprpc.so        — Android-style vendor partition
+  //   3. /usr/lib/aarch64-linux-gnu/libcdsprpc.so
+  //   4. /usr/lib/libcdsprpc.so
+  //   5. /usr/local/lib/libcdsprpc.so
   //
-  // TODO(fabio): a POSIX host cannot reach the on-device NPU at all; give
-  // `resolveDriverPackageDirectory` a POSIX arm once a Linux host needs it.
-  return Error("the on-device NPU backend requires Windows");
+  // If none of those work, MODULAR_NPU_TRANSPORT_LIB (already handled above)
+  // is the escape hatch for non-standard BSP layouts.
+  {
+    static constexpr const char *kLinuxLibName = "libcdsprpc.so";
+
+    auto tryBind = [](const std::string &path) -> ErrorOr<QuRTDriver> {
+      size_t sep = path.find_last_of('/');
+      std::string dir =
+          sep != std::string::npos ? path.substr(0, sep) : std::string(".");
+      return bindLibrary(path, dir);
+    };
+
+    if (const char *adspDir = getenv("ADSP_LIBRARY_PATH");
+        adspDir != nullptr && *adspDir != '\0') {
+      ErrorOr<QuRTDriver> result =
+          tryBind(std::string(adspDir) + "/" + kLinuxLibName);
+      if (!result.isError())
+        return result;
+    }
+
+    // BSP packages sometimes ship only the versioned soname (libcdsprpc.so.1)
+    // without a bare .so devlink, so both forms are tried.
+    static constexpr const char *kCandidates[] = {
+        "/vendor/lib64/libcdsprpc.so",
+        "/vendor/lib64/libcdsprpc.so.1",
+        "/usr/lib/aarch64-linux-gnu/libcdsprpc.so",
+        "/usr/lib/aarch64-linux-gnu/libcdsprpc.so.1",
+        "/usr/lib/libcdsprpc.so",
+        "/usr/lib/libcdsprpc.so.1",
+        "/usr/local/lib/libcdsprpc.so",
+        "/usr/local/lib/libcdsprpc.so.1",
+        nullptr,
+    };
+    for (const char *const *p = kCandidates; *p != nullptr; ++p) {
+      ErrorOr<QuRTDriver> result = tryBind(*p);
+      if (!result.isError())
+        return result;
+    }
+
+    return Error("libcdsprpc.so not found on this Linux host; set "
+                 "ADSP_LIBRARY_PATH to the directory containing it, or set "
+                 "MODULAR_NPU_TRANSPORT_LIB to the full library path");
+  }
 #else
   ErrorOr<std::string> directory = resolveDriverPackageDirectory();
   if (directory.isError())
