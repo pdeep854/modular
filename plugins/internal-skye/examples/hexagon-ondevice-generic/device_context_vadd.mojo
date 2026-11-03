@@ -33,7 +33,7 @@ Set MODULAR_NPU_RPC_ABI=generic (the default) and make sure libcdsprpc.so is
 discoverable via ADSP_LIBRARY_PATH or standard system paths.
 """
 
-from npu_context import DeviceContext, Dim
+from npu_context import DeviceContext, DeviceExternalFunction, Dim
 
 
 # One FastRPC session addresses one NSP core.
@@ -58,6 +58,30 @@ def npu_sig():
 
 def is_finite_f32(v: Float32) -> Bool:
     return v == v and v - v == 0
+
+
+def vadd_dispatch(ctx: DeviceContext, f: DeviceExternalFunction,
+                  a: UInt64, b: UInt64, c: UInt64, n: Int32) raises:
+    """Dispatches vadd with explicit rejection of non-positive element counts.
+
+    Args:
+        ctx: NPU device context.
+        f: Resolved vadd kernel handle.
+        a: Device buffer address for lhs.
+        b: Device buffer address for rhs.
+        c: Device buffer address for output.
+        n: Element count; must be > 0.
+
+    Raises:
+        Error if n <= 0 or if the dispatch fails.
+    """
+    if n <= 0:
+        raise Error("vadd element count must be > 0, got " + String(Int(n)))
+    ctx.enqueue_function(
+        f, a, b, c, n,
+        grid_dim=Dim(NPU_GRID_CORES),
+        block_dim=Dim(NPU_THREAD_MASK),
+    )
 
 
 def report(name: String, n: Int,
@@ -101,15 +125,8 @@ def run_vadd_size(ctx: DeviceContext, n: Int) raises -> Bool:
     var f = ctx.load_function[npu_sig](
         function_name=String("vadd"), asm=String("")
     )
-    ctx.enqueue_function(
-        f,
-        a_dev.unsafe_ptr(),
-        b_dev.unsafe_ptr(),
-        c_dev.unsafe_ptr(),
-        Int32(n),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
-    )
+    vadd_dispatch(ctx, f, a_dev.unsafe_ptr(), b_dev.unsafe_ptr(),
+                  c_dev.unsafe_ptr(), Int32(n))
     ctx.synchronize()
 
     c_dev.enqueue_copy_to(c_host)
@@ -182,15 +199,8 @@ def run_vadd_slice(ctx: DeviceContext, total: Int, start: Int, n: Int) raises ->
     var f = ctx.load_function[npu_sig](
         function_name=String("vadd"), asm=String("")
     )
-    ctx.enqueue_function(
-        f,
-        a_slice.unsafe_ptr(),
-        b_slice.unsafe_ptr(),
-        c_slice.unsafe_ptr(),
-        Int32(n),
-        grid_dim=Dim(NPU_GRID_CORES),
-        block_dim=Dim(NPU_THREAD_MASK),
-    )
+    vadd_dispatch(ctx, f, a_slice.unsafe_ptr(), b_slice.unsafe_ptr(),
+                  c_slice.unsafe_ptr(), Int32(n))
     ctx.synchronize()
 
     c_slice.enqueue_copy_to(c_host)
@@ -224,7 +234,7 @@ def run_vadd_slice(ctx: DeviceContext, total: Int, start: Int, n: Int) raises ->
 
 def run_vadd_negative_count(ctx: DeviceContext) raises -> Bool:
     """Verifies that n <= 0 is refused before reaching the device."""
-    var dummy = ctx.enqueue_create_host_buffer[DType.float32](4)
+    _ = ctx.enqueue_create_host_buffer[DType.float32](4)
     var dev   = ctx.enqueue_create_buffer[DType.float32](4)
 
     var refused = False
@@ -232,15 +242,8 @@ def run_vadd_negative_count(ctx: DeviceContext) raises -> Bool:
         var f = ctx.load_function[npu_sig](
             function_name=String("vadd"), asm=String("")
         )
-        ctx.enqueue_function(
-            f,
-            dev.unsafe_ptr(),
-            dev.unsafe_ptr(),
-            dev.unsafe_ptr(),
-            Int32(-1),
-            grid_dim=Dim(NPU_GRID_CORES),
-            block_dim=Dim(NPU_THREAD_MASK),
-        )
+        vadd_dispatch(ctx, f, dev.unsafe_ptr(), dev.unsafe_ptr(),
+                      dev.unsafe_ptr(), Int32(-1))
         ctx.synchronize()
     except:
         refused = True

@@ -26,6 +26,7 @@ Provides: DeviceContext, HostBuffer, DeviceBuffer, DeviceExternalFunction, Dim.
 from std.ffi import external_call, c_uint
 from std.memory import Pointer
 from std.collections import List
+from std.sys import size_of
 
 
 # ---------------------------------------------------------------------------
@@ -100,35 +101,55 @@ struct HostBuffer[dtype: DType](Copyable):
 
 
 struct DeviceBuffer[dtype: DType](Copyable):
-    """On-device buffer backed by a List allocation.
+    """On-device buffer backed by an AsyncRT rpcmem allocation.
 
-    Host and device buffers are separate allocations; copy methods do an
-    element-wise CPU transfer between them.
+    Memory is allocated by the DeviceContext via rpcmem_alloc so that the NPU
+    kernel dispatch path can locate the buffer by address through
+    allocationFrom().  Plain heap memory (e.g. List) is rejected at dispatch
+    time because the QuRT device only tracks rpcmem-allocated regions.
     """
 
-    var _data: List[Scalar[Self.dtype]]
+    var _ctx: Int      # DeviceContext* stored as Int for FFI
+    var _ptr: UInt64   # rpcmem address returned by createBuffer_async
+    var _n: Int        # element count
 
-    def __init__(out self, n: Int):
-        self._data = List[Scalar[Self.dtype]](capacity=n)
-        for _ in range(n):
-            self._data.append(Scalar[Self.dtype](0))
+    def __init__(out self, ctx: Int, n: Int) raises:
+        var buf: Int = 0
+        var ptr: Int = 0
+        var err = external_call[
+            "AsyncRT_DeviceContext_createBuffer_async",
+            UInt64,
+        ](
+            Pointer(to=buf),
+            Pointer(to=ptr),
+            ctx,
+            n,
+            size_of[Scalar[Self.dtype]](),
+        )
+        if err != 0:
+            raise Error("AsyncRT_DeviceContext_createBuffer_async failed")
+        self._ctx = ctx
+        self._ptr = UInt64(ptr)
+        self._n = n
 
     def unsafe_ptr(self) -> UInt64:
-        """Returns the raw address of the backing storage."""
-        return UInt64(Int(self._data.unsafe_ptr()))
+        """Returns the rpcmem address passed to the NPU kernel as a buffer arg."""
+        return self._ptr
 
     def size(self) -> Int:
-        return len(self._data)
+        return self._n
 
     def enqueue_copy_from(mut self, src: HostBuffer[Self.dtype]):
-        var n = len(self._data) if len(self._data) < src.size() else src.size()
-        for i in range(n):
-            self._data[i] = src._data[i]
+        var bytes = self._n * size_of[Scalar[Self.dtype]]()
+        _ = external_call["AsyncRT_DeviceContext_HtoD_async_sized", UInt64](
+            self._ctx, self._ptr, src.unsafe_ptr(), bytes
+        )
 
     def enqueue_copy_to(self, mut dst: HostBuffer[Self.dtype]):
-        var n = len(self._data) if len(self._data) < dst.size() else dst.size()
-        for i in range(n):
-            dst._data[i] = self._data[i]
+        var bytes = self._n * size_of[Scalar[Self.dtype]]()
+        _ = external_call["AsyncRT_DeviceContext_DtoH_async_sized", UInt64](
+            self._ctx, dst.unsafe_ptr(), self._ptr, bytes
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +213,19 @@ struct DeviceContext(Copyable):
 
     def enqueue_create_buffer[dtype: DType](
         self, n: Int
-    ) -> DeviceBuffer[dtype]:
-        """Allocates a device buffer of `n` elements.
+    ) raises -> DeviceBuffer[dtype]:
+        """Allocates a device buffer of `n` elements via rpcmem.
 
         Args:
             n: Number of elements.
 
         Returns:
-            A `DeviceBuffer` wrapping the allocation.
+            A `DeviceBuffer` wrapping the rpcmem allocation.
+
+        Raises:
+            Error if AsyncRT_DeviceContext_createBuffer_async fails.
         """
-        return DeviceBuffer[dtype](n)
+        return DeviceBuffer[dtype](self._handle, n)
 
     def synchronize(self) raises:
         """Blocks until all enqueued NPU operations complete.
@@ -285,8 +309,12 @@ struct DeviceContext(Copyable):
         """
         comptime num_args = Ts.length
         var dense_args = List[UInt64](capacity=num_args)
+        # argSizes must be non-null when the kernel has scalar arguments:
+        # QuRTDeviceContext packs scalars by byte width using this array.
+        var arg_sizes = List[UInt64](capacity=num_args)
         comptime for i in range(num_args):
             dense_args.append(UInt64(Int(Pointer(to=args[i]))))
+            arg_sizes.append(UInt64(size_of[Ts[i]]()))
         var err = external_call[
             "AsyncRT_DeviceContext_enqueueFunctionDirect",
             UInt64,
@@ -304,7 +332,7 @@ struct DeviceContext(Copyable):
             c_uint(0),
             dense_args.unsafe_ptr(),
             c_uint(num_args),
-            UInt64(0),
+            arg_sizes.unsafe_ptr(),
         )
         if err != 0:
             raise Error("AsyncRT_DeviceContext_enqueueFunctionDirect failed")
