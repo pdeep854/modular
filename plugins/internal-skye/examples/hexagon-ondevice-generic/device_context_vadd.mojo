@@ -33,7 +33,7 @@ Set MODULAR_NPU_RPC_ABI=generic (the default) and make sure libcdsprpc.so is
 discoverable via ADSP_LIBRARY_PATH or standard system paths.
 """
 
-from std.gpu.host import DeviceContext, Dim
+from npu_context import DeviceContext, Dim
 
 
 # One FastRPC session addresses one NSP core.
