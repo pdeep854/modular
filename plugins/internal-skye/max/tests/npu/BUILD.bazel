@@ -1,0 +1,683 @@
+load("@@//bazel:api.bzl", "mojo_test_environment")
+load("@rules_python//python:defs.bzl", "py_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# Sourced by the mach_bundle eligibility test the way the examples package
+# exports npu_weight_repack.py: the consumer-table grammar and the selection
+# rule must be pinned by one test even though they live in two packages.
+exports_files(["flux_stager_inventory.py"])
+
+# `custom_extensions` precompiles the registration package in-process, so the
+# import path has to carry the packages it imports.
+mojo_test_environment(
+    name = "_mojo_env",
+    testonly = True,
+    data = [
+        "@@//max:builtin_kernels",
+        "@@//max:builtin_primitives",
+        "@@//max:extensibility",
+    ],
+)
+
+_ENV = {
+    "MODULAR_MOJO_MAX_COMPILERRT_PATH": "$(COMPILER_RT_PATH)",
+    "MODULAR_MOJO_MAX_DRIVER_PATH": "$(MOJO_BINARY_PATH)",
+    "MODULAR_MOJO_MAX_IMPORT_PATH": "$(COMPUTED_IMPORT_PATH)",
+    "MODULAR_MOJO_MAX_LINKER_DRIVER": "$(MOJO_LINKER_DRIVER)",
+    "MODULAR_MOJO_MAX_LLD_PATH": "$(LLD_PATH)",
+    "MODULAR_MOJO_MAX_SHARED_LIBS": "$(COMPUTED_LIBS)",
+    "MODULAR_MOJO_MAX_SYSTEM_LIBS": "$(MOJO_LINKER_SYSTEM_LIBS)",
+}
+
+# The census drives its probe in a subprocess per op, so the probe travels as a
+# source of that target rather than as a test of its own.
+_EXTRA_SRCS = {
+    "test_npu_op_disposition.py": ["npu_op_disposition_probe.py"],
+    "test_npu_op_disposition_census.py": ["npu_op_disposition_probe.py"],
+}
+
+# The disposition test audits every sibling's `Graph(...)` calls by globbing
+# next to its own `__file__`. Declared so the audited set is the whole package
+# wherever the test runs: an execution mode that materializes only declared
+# inputs (remote, for one) would otherwise hand the glob just this target's
+# sources and pass the audit over them vacuously.
+_EXTRA_DATA = {
+    "test_npu_op_disposition.py": glob(["test_npu_*.py"]),
+}
+
+# The exhaustive sweep is a research target, not a presubmit: it compiles one
+# graph per op in a process of its own. `test_npu_op_disposition` is the landed
+# guard, carrying the rungs the sweep measured.
+_MANUAL = ["test_npu_op_disposition_census.py"]
+
+# One compile per case in a process of its own, so both probing targets need the
+# longer budget. Sharding them is not an option: `pytest_runner` does not accept
+# bazel's `--shard-id`/`--num-shards`.
+_SLOW = [
+    "test_npu_op_disposition.py",
+    "test_npu_op_disposition_census.py",
+]
+
+# The two probing sweeps outgrew even the `long` ceiling off the Macs: both
+# measured past 900 s on the x86 fleet box and on remote executors alike
+# (2026-08-16; the ARM hosts finish in minutes). `eternal` still catches a
+# genuine hang while letting slower hosts run the same 143-target gate as the
+# Mac seat. Recipe and evidence: .agentwork/flux-npu/fleet/BOX_GATE.md.
+_SLOWEST = [
+    "test_npu_op_disposition_census.py",
+    "test_npu_slice_materialization.py",
+]
+
+# No `target_compatible_with`: virtual-device mode enumerates the NPU, so these
+# compile on any host. Unlike `../qaic`, they need no device and no driver
+# plugin.
+#
+# Separate targets because `set_virtual_cpu_target` is process-global: the
+# cross-compile case would retarget every compile that followed it.
+[
+    py_test(
+        name = test_file[:-3],
+        size = "large" if test_file in _SLOW else "medium",
+        # The slice census compiles ~40 graphs in one process, which does not
+        # fit the timeout `size` implies.
+        timeout = "eternal" if test_file in _SLOWEST else "long",
+        srcs = [
+            test_file,
+            "@@//bazel/internal:pytest_runner",
+        ] + _EXTRA_SRCS.get(test_file, []),
+        args = [
+            "$(rootpath " + test_file + ")",
+            "-svv",
+            "--color=yes",
+        ],
+        data = [
+            "_mojo_env",
+            "npu_slice_materialization_probe.py",
+            "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+        ] + _EXTRA_DATA.get(test_file, []),
+        env = _ENV,
+        main = "pytest_runner.py",
+        tags = ["npu"] + (["manual"] if test_file in _MANUAL else []),
+        toolchains = [
+            "@@//bazel/internal:current_gpu_toolchain",
+            "_mojo_env",
+        ],
+        deps = [
+            "@@//max/python/max/driver",
+            "@@//max/python/max/dtype",
+            "@@//max/python/max/engine",
+            "@@//max/python/max/graph",
+            "@@//max/python/max/nn",
+            "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+        ],
+    )
+    for test_file in [
+        "test_npu_graph_add_windows.py",
+        "test_npu_graph_attention_chain.py",
+        "test_npu_graph_attention_chain_windows.py",
+        "test_npu_graph_batch_matmul.py",
+        "test_npu_graph_cast.py",
+        "test_npu_graph_constfold_windows.py",
+        "test_npu_graph_conv_mid.py",
+        "test_npu_graph_conv_mid_windows.py",
+        "test_npu_graph_gated_residual.py",
+        "test_npu_graph_gated_residual_windows.py",
+        "test_npu_graph_groupnorm.py",
+        "test_npu_graph_groupnorm_weights_windows.py",
+        "test_npu_graph_groupnorm_windows.py",
+        "test_npu_graph_layernorm.py",
+        "test_npu_graph_layernorm_windows.py",
+        "test_npu_graph_matmul.py",
+        "test_npu_graph_mha_no_cache.py",
+        "test_npu_graph_modulation.py",
+        "test_npu_graph_modulation_fp16_windows.py",
+        "test_npu_graph_modulation_symbolic_windows.py",
+        "test_npu_graph_modulation_windows.py",
+        "test_npu_graph_movement.py",
+        "test_npu_op_disposition.py",
+        "test_npu_op_disposition_census.py",
+        "test_npu_graph_matmul_windows.py",
+        "test_npu_graph_rms_norm.py",
+        "test_npu_graph_rms_norm_windows.py",
+        "test_npu_graph_rope.py",
+        "test_npu_graph_rope_windows.py",
+        "test_npu_graph_sincos_tables.py",
+        "test_npu_graph_softmax.py",
+        "test_npu_slice_materialization.py",
+        "test_npu_unregistered_op.py",
+    ]
+]
+
+# Its own rule rather than a row in the list above: this one stages a whole
+# pipeline architecture, so it carries the flux2 dependency the rest do not.
+# It stages and never compiles. The NPU compile is cheap and is
+# `test_flux_denoise_whole_graph`'s job below; the compile that could yield
+# this number directly needs a GPU target (the one device where every kernel
+# elaborates) and has never completed -- eight remote attempts were OOM-killed
+# at 48.7 to 59.5 GiB, one under an 88 GiB `test.EstimatedMemory` declaration
+# the scheduler accepted. That `exec_properties` key is how a raw py_test asks
+# for memory (`get_resources_exec_properties` is reachable only from
+# `modular_py_test`/`mojo_test`); no target in this package needs it.
+py_test(
+    name = "test_flux_activation_pool",
+    size = "large",
+    srcs = [
+        "test_flux_activation_pool.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_activation_pool.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = ["_mojo_env"],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# Its own rule for `test_flux_activation_pool`'s reason: it stages through
+# the flux2 architecture's own embedding and rope-packing functions, so it
+# carries the flux2 dependency the listed tests do not. Not `manual`: its
+# NPU compiles are single-expression graphs, seconds not minutes, and the
+# host-exactness half runs on the plain CPU.
+py_test(
+    name = "test_npu_graph_preamble_minting",
+    size = "large",
+    srcs = [
+        "test_npu_graph_preamble_minting.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_graph_preamble_minting.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# Its own rule for `test_flux_activation_pool`'s reason: the graph-grain
+# upsample composite lives beside the idiom it recognizes in the autoencoder
+# model code, so the test carries the flux2 dependency the listed tests do
+# not. Not `manual`: its compiles are single-Upsample2D graphs and its
+# executions run on the plain CPU.
+py_test(
+    name = "test_npu_graph_upsample_composite",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "test_npu_graph_upsample_composite.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_graph_upsample_composite.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The composite's cross-compile: separate target because
+# `set_virtual_cpu_target` is process-global, and its own rule for the
+# flux2 dependency.
+py_test(
+    name = "test_npu_graph_upsample_composite_windows",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "test_npu_graph_upsample_composite_windows.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_graph_upsample_composite_windows.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The probe past the whole-graph wall: substitutes the three refusing
+# families, compiles to a MEF, and (with FLUX_MEF_DUMP) writes the weights
+# registry and inputs for the device driver. `manual` for the same reason as
+# the whole-graph compile, and because the windows mode retargets the
+# process.
+py_test(
+    name = "test_flux_denoise_mef",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        # The staging rewrite is shared with the whole-graph stager, and the
+        # census test stages through that module too -- both imported, not
+        # collected.
+        "flux_rope_fused_staging.py",
+        "flux_stager_inventory.py",
+        "test_flux_denoise_mef.py",
+        "test_flux_denoise_whole_graph.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_denoise_mef.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = [
+        "manual",
+        "npu",
+    ],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The sibling of the pool test that does compile, so it is `manual`: the
+# compile is minutes and gigabytes rather than the seconds staging costs, and
+# an executor that runs it on every presubmit would be paying that for a
+# result that only changes when a registration does.
+py_test(
+    name = "test_flux_denoise_whole_graph",
+    size = "large",
+    srcs = [
+        # Imported, not collected: the run package's dump leg reuses the
+        # sibling's checkpoint loader (the `WeightData.astype` workaround)
+        # rather than growing a second copy of it, and the fused-qk staging
+        # rewrite is the same shared object the mef stager applies.
+        "flux_rope_fused_staging.py",
+        "flux_stager_inventory.py",
+        "test_flux_denoise_mef.py",
+        "test_flux_denoise_whole_graph.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_denoise_whole_graph.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = [
+        "manual",
+        "npu",
+    ],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The encoder leg's whole-graph compile, `test_flux_denoise_whole_graph`'s
+# sibling for the Qwen3 text encoder: same census-or-MEF contract, `manual`
+# for the same reason -- the compile costs minutes only when a registration
+# changes the answer. It stages through the qwen3 text-encoder package, the
+# one architecture dependency the encoder actually runs.
+py_test(
+    name = "test_flux_encoder_whole_graph",
+    size = "large",
+    srcs = [
+        # Imported, not collected: the dump leg reuses the denoise sibling's
+        # `_host_array` materializer (which carries the bf16 widening), and
+        # that module imports the staging rewrite.
+        "flux_rope_fused_staging.py",
+        "flux_stager_inventory.py",
+        "test_flux_denoise_mef.py",
+        "test_flux_encoder_whole_graph.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_encoder_whole_graph.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = [
+        "manual",
+        "npu",
+    ],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/qwen3",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The VAE leg's whole-graph compile, closing the render's three-leg set. It
+# stages `PostprocessAndDecode` through the flux2 component (which carries
+# the `autoencoders` Decoder), so it takes the flux2 dependency the denoise
+# tests do.
+py_test(
+    name = "test_flux_vae_whole_graph",
+    size = "large",
+    srcs = [
+        # Imported, not collected: the dump leg reuses the denoise sibling's
+        # `_host_array` materializer (which carries the bf16 widening), and
+        # that module imports the staging rewrite.
+        "flux_rope_fused_staging.py",
+        "flux_stager_inventory.py",
+        "test_flux_denoise_mef.py",
+        "test_flux_vae_whole_graph.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_vae_whole_graph.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = [
+        "manual",
+        "npu",
+    ],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The DRAFT-304 prefix ladder: the VAE graph truncated after a named seam,
+# one rung per invocation (`FLUX_VAE_PREFIX`). Its own rule for the flux2
+# dependency; `manual` like its whole-graph siblings (a mint tool invokes it
+# with --test_env, it is not gate inventory).
+py_test(
+    name = "test_npu_graph_vae_prefix_windows",
+    size = "large",
+    srcs = [
+        "test_npu_graph_vae_prefix_windows.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_graph_vae_prefix_windows.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = [
+        "manual",
+        "npu",
+    ],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The bundle's fourth stage -- the compiled Euler step no existing NPU stage
+# provides. Its own rule for the flux2 dependency, but NOT `manual`: unlike
+# its whole-graph siblings this graph is four elementwise ops, so the compile
+# is seconds-class like the listed rows.
+py_test(
+    name = "test_flux_denoise_predict_whole_graph",
+    size = "medium",
+    timeout = "long",
+    srcs = [
+        "test_flux_denoise_predict_whole_graph.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_flux_denoise_predict_whole_graph.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "_mojo_env",
+        "//max/kernels/src/hexagon_ondevice:hexagon_ondevice_srcs",
+    ],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The temb-projection fusion's two contracts (adapter member order, staged
+# math parity), on CPU graphs -- seconds-class and device-free, so it rides
+# the fast gate rather than the manual whole-graph list.
+py_test(
+    name = "test_npu_temb_projection_fusion",
+    size = "medium",
+    srcs = [
+        "test_npu_temb_projection_fusion.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_temb_projection_fusion.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = ["_mojo_env"],
+    env = _ENV,
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    toolchains = [
+        "@@//bazel/internal:current_gpu_toolchain",
+        "_mojo_env",
+    ],
+    deps = [
+        "@@//max/python/max/driver",
+        "@@//max/python/max/dtype",
+        "@@//max/python/max/engine",
+        "@@//max/python/max/graph",
+        "@@//max/python/max/pipelines/architectures/flux2",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The per-dispatch IO-dump differ runs on fixture records alone -- no compile,
+# no mojo environment -- so it is its own rule rather than a row in the list.
+py_test(
+    name = "test_npu_iodump_diff",
+    size = "small",
+    srcs = [
+        "test_npu_iodump_diff.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_iodump_diff.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = ["//utils:npu_iodump_diff.py"],
+    env = {"NPU_IODUMP_DIFF": "$(rootpath //utils:npu_iodump_diff.py)"},
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The def/C parity gate (order 322): every entry a NPUKernels.def row calls
+# must be declared in mojo_npu_imp.c, the trampoline TU the box's
+# hexagon-clang compiles and nothing on the Mac gate ever did. Device-free
+# on purpose — it is the ladder rung that keeps the 322 class from reaching
+# a ceremony again.
+py_test(
+    name = "test_npu_def_c_parity",
+    size = "small",
+    srcs = [
+        "test_npu_def_c_parity.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_def_c_parity.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "//examples/hexagon-ondevice:mojo_npu_imp.c",
+        "//runtime/lib/qurt:NPUKernels.def",
+    ],
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+# The def/host parity gate (order 325), the C gate's sibling for the OTHER
+# expansion of NPUKernels.def: the host packer TU whose compiled table is the
+# engine exe's kernel manifest. Pins the two properties no compile checks —
+# name uniqueness (findKernel shadows silently) and the FastRPC slot ceiling
+# (enforced only at dispatch time, on device) — plus the window rows' wire
+# tuples the relinked exe's census banks against.
+py_test(
+    name = "test_npu_def_host_parity",
+    size = "small",
+    srcs = [
+        "test_npu_def_host_parity.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath test_npu_def_host_parity.py)",
+        "-svv",
+        "--color=yes",
+    ],
+    data = [
+        "//runtime/lib/qurt:NPUKernels.def",
+        "//runtime/lib/qurt:QuRTDeviceContext.cpp",
+    ],
+    main = "pytest_runner.py",
+    tags = ["npu"],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)

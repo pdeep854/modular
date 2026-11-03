@@ -1,0 +1,112 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# The Mach bundle assembler computes the bundle's constant inputs (text_ids,
+# latent-image ids, carriers) and geometry with this package's own functions
+# rather than growing a second derivation of them.
+py_library(
+    name = "flux_klein_host",
+    srcs = glob(["flux_klein_host/*.py"]),
+    imports = ["."],
+    tags = ["no-mypy"],
+    visibility = ["//utils/mach_bundle:__pkg__"],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:numpy",
+    ],
+)
+
+# The P1.3 thin runner: one command, prompt -> image, every compute stage a
+# MAX MEF on the NPU (denoise today; encoder/VAE flip from `hand` when their
+# staging directories exist). The lane box runs the file in place with its
+# venv python; this target is the bazel-run equivalent.
+py_binary(
+    name = "flux_runner",
+    srcs = ["flux_runner.py"] + glob(["flux_klein_host/*.py"]),
+    imports = ["."],
+    main = "flux_runner.py",
+    tags = ["no-mypy"],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:numpy",
+    ],
+)
+
+# The host pipeline's own validation -- the sampling math, the flow-match
+# schedule, the timestep conditioning, and the data contract at each device
+# seam. numpy only: the diffusers and real-tokenizer cross-checks skip cleanly
+# when those are absent, so this needs no device and no heavy dependency.
+#
+# One target rather than one per file: they share `conftest.py` and
+# `references.py`, and the suite is seconds.
+#
+# NOT YET COVERED, and it is a gap rather than a decision: `test_scheduler.py`
+# and `test_pipeline.py` load MAX's own flow-match scheduler and the V1 weight
+# converter by walking up from `__file__` to the monorepo root, which the
+# sandbox does not have -- 15 of the suite's 109 tests. Wiring them needs a
+# runfiles-aware root, not a change to what they assert. Until then they run
+# only in place (`python -m pytest tests -q` from this directory).
+# The thin runner's device-free proof (P1.3): orchestration, lane-lock
+# discipline, WSL knob plumbing and the vsock retry, all against stubbed
+# stage executors. Its own target so the device-free gate's discovery floor
+# counts the runner's coverage separately from the numerics suite above.
+py_test(
+    name = "flux_runner_test",
+    size = "small",
+    srcs = [
+        "tests/conftest.py",
+        "tests/test_flux_runner.py",
+        "tests/test_serve_session.py",
+        "@@//bazel/internal:pytest_runner",
+    ],
+    args = [
+        "$(rootpath tests/test_flux_runner.py)",
+        "$(rootpath tests/test_serve_session.py)",
+        "-q",
+        "--color=yes",
+    ],
+    data = glob(
+        [
+            "flux_klein_host/*.py",
+            "flux_runner.py",
+        ],
+        allow_empty = True,
+    ),
+    imports = ["."],
+    main = "pytest_runner.py",
+    tags = [
+        "no-mypy",
+        "npu",
+    ],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:numpy",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)
+
+py_test(
+    name = "flux_npu_host_tests",
+    size = "medium",
+    srcs = glob(["tests/*.py"]) + ["@@//bazel/internal:pytest_runner"],
+    args = [
+        "$(rootpath tests/test_denoise_loop.py)",
+        "$(rootpath tests/test_device_bridge.py)",
+        "$(rootpath tests/test_device_seams.py)",
+        "$(rootpath tests/test_latents.py)",
+        "$(rootpath tests/test_modulation.py)",
+        "$(rootpath tests/test_rope.py)",
+        "$(rootpath tests/test_timestep_embed.py)",
+        "-q",
+        "--color=yes",
+    ],
+    data = glob(["flux_klein_host/*.py"]),
+    imports = ["."],
+    main = "pytest_runner.py",
+    tags = [
+        "no-mypy",
+        "npu",
+    ],
+    deps = [
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:numpy",
+        "@@rules_pycross++lock_file+modular_pip_lock_file_repo//deps:pytest",
+    ],
+)

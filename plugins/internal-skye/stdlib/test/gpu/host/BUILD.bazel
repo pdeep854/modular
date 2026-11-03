@@ -1,0 +1,183 @@
+load(
+    "//bazel:mojo_skye_test.bzl",
+    "mojo_skye_compile_suite",
+    "mojo_skye_compile_test",
+    "mojo_skye_test",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+# Tests that intentionally bypass stdlib paths (e.g. raw libc external_calls)
+# can't be built with assertions on — the stdlib code paths pulled in by
+# debug_assert conflict with the test's bare `external_call` declarations.
+_ASSERTS_DISABLED = ["test_qaic_heap_probe.mojo"]
+
+# QCCL tests need 2 ranks rendezvousing on a real QAIC device — gate them
+# behind manual selection (`//stdlib/test/gpu/host:qccl_tests` or the
+# top-level `//:qccl_tests` alias) so they don't fire under `//...`. Each
+# test occupies devices 0 and 1, so they're also `exclusive` to keep bazel
+# from running them concurrently and oversubscribing device memory.
+_QCCL_TESTS = [
+    "test_qaic_qccl_all_gather.mojo",
+    "test_qaic_qccl_all_gather_discrete.mojo",
+    "test_qaic_qccl_all_reduce_fp16.mojo",
+    "test_qaic_qccl_broadcast.mojo",
+    "test_qaic_qccl_send_recv.mojo",
+]
+
+# Tensor-parallel matmul + QCCL tests. Same constraints as the QCCL tests —
+# 2 ranks on devices 0 and 1 — so they're 2-device, exclusive, and manual.
+_TP_TESTS = [
+    "test_qaic_tp_row_parallel_all_reduce.mojo",
+    "test_qaic_tp_column_parallel_all_gather.mojo",
+    "test_qaic_tp_mlp.mojo",
+]
+
+# Every test that rendezvouses 2 ranks across 2 devices.
+_TWO_DEVICE_TESTS = _QCCL_TESTS + _TP_TESTS
+
+# 4-rank tensor-parallel tests — same patterns as _TP_TESTS, across 4 devices.
+_TP4_TESTS = [
+    "test_qaic_tp4_row_parallel_all_reduce.mojo",
+    "test_qaic_tp4_column_parallel_all_gather.mojo",
+    "test_qaic_tp4_mlp.mojo",
+    "test_qaic_tp4_gemma4_layer.mojo",
+]
+
+# Every multi-device test (exclusive + manual, regardless of device count).
+_MULTI_DEVICE_TESTS = _TWO_DEVICE_TESTS + _TP4_TESTS
+
+# Manual only tests
+_MANUAL_TESTS = [
+    # Fatal error resets the device,
+    # preventing usage for a brief O(seconds) time
+    "test_qaic_assert.mojo",
+    "test_qaic_assert_multithread.mojo",
+    "test_qaic_repro_qs_error.mojo",
+    # Exploratory characterization: drives sub-tile / unaligned shapes through
+    # crouton paths the production kernels never exercise. Print-heavy; run by
+    # hand rather than under `//...`.
+    "test_qaic_crouton_padding.mojo",
+    # Concurrency characterization (topology, DMA/compute overlap, multi-NSP
+    # scaling). Perf-timing + print-heavy; run by hand, not under `//...`.
+    "test_qaic_npu_concurrency.mojo",
+    # Measures the VTCM zeroing cost that DEV_TCM + RESIDENT_KEEP persistence
+    # avoids. Timing + print-heavy; run by hand, not under `//...`.
+    "test_qaic_vtcm_persistence_perf.mojo",
+    # Device-graph creation vs dispatch vs execution micro-benchmarks.
+    # Timing + print-heavy; run by hand, not under `//...`.
+    "test_qaic_device_graph_bench.mojo",
+    # Stage B (FP32 all_reduce) deadlocks in the AIC100 SDK's QCCL request
+    # planner (rank-asymmetric NSP allocation); kept manual until the SDK
+    # fix lands. See file docstring.
+    "test_qaic_qccl.mojo",
+    # Failing after 1.23.0.26 SDK update, only on CI
+    "test_qaic_crouton_roundtrip.mojo",
+    "test_qaic_device_graph.mojo",
+    # MOCO-4655
+    "test_qaic_qccl_all_gather_discrete.mojo",
+    "test_qaic_qccl_all_gather.mojo",
+] + _MULTI_DEVICE_TESTS
+
+# Tests that do not depend on the qaic_test_utils package — kept separate
+# so a broken helper doesn't block builds of standalone NPU tests.
+_NO_TEST_UTILS = [
+    "test_elementwise_npu_nested.mojo",
+    "test_npu_named_adapter_captures.mojo",
+]
+
+# All test sources, shared by the run-tests loop and the compile-only loop
+# below.
+_ALL_TESTS = glob(
+    ["**/*.mojo"],
+    exclude = [
+        "common.mojo",
+        "qaic_test_utils/**",
+    ],
+)
+
+[
+    mojo_skye_test(
+        name = src + ".test",
+        srcs = [src],
+        additional_compiler_inputs = ["common.mojo"],
+        enable_assertions = src not in _ASSERTS_DISABLED,
+        qaic_device_count = (
+            4 if src in _TP4_TESTS else (2 if src in _TWO_DEVICE_TESTS else 1)
+        ),
+        tags = (
+            (["manual"] if src in _MANUAL_TESTS else [])
+        ),
+        deps = (
+            ([] if src in _NO_TEST_UTILS else [
+                "//stdlib/test/gpu/host/qaic_test_utils",
+            ]) + [
+                "@@//max:layout",
+                "@@//max:max_mojo",
+            ]
+        ),
+    )
+    for src in _ALL_TESTS
+]
+
+test_suite(name = "all")
+
+# Compile-only smoke coverage: builds every test, never runs it. The accelerator
+# follows the active config: aic100 (`--config=local-skye100`) or aic200
+# (`--config=local-skye200`).
+#
+# test_qaic_npu_concurrency.mojo has duplicate top-level definitions and does not
+# compile; it is a manual test never built under `//...`.
+_COMPILE_EXCLUDE = [
+    "test_qaic_npu_concurrency.mojo",
+    # MOCO-4655
+    "test_qaic_qccl_all_gather_discrete.mojo",
+    "test_qaic_qccl_all_gather.mojo",
+]
+
+[
+    mojo_skye_compile_test(
+        name = src + ".compile",
+        srcs = [src],
+        additional_compiler_inputs = ["common.mojo"],
+        enable_assertions = src not in _ASSERTS_DISABLED,
+        deps = (
+            ([] if src in _NO_TEST_UTILS else [
+                "//stdlib/test/gpu/host/qaic_test_utils",
+            ]) + [
+                "@@//max:layout",
+                "@@//max:max_mojo",
+            ]
+        ),
+    )
+    for src in _ALL_TESTS
+    if src not in _COMPILE_EXCLUDE
+]
+
+mojo_skye_compile_suite(
+    name = "compile",
+    targets = [
+        src + ".compile"
+        for src in _ALL_TESTS
+        if src not in _COMPILE_EXCLUDE
+    ],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "qccl_tests",
+    tests = [src + ".test" for src in _QCCL_TESTS if src not in _MANUAL_TESTS],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tp_tests",
+    tests = [src + ".test" for src in _TP_TESTS],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tp4_tests",
+    tests = [src + ".test" for src in _TP4_TESTS],
+    visibility = ["//visibility:public"],
+)

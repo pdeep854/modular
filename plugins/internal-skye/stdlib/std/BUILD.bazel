@@ -1,0 +1,126 @@
+load("@@//bazel:api.bzl", "mojo_overlay_layer")
+load("@@//max/kernels/src:deprecations.bzl", "IGNORED_POINTER_DEPRECATIONS_COPTS")
+load("//bazel:mojo_merged_precompile.bzl", "mojo_merged_precompile")
+
+package(default_visibility = ["//visibility:public"])
+
+# Plugin overlay + QAIC-only .mojo files.
+filegroup(
+    name = "overlay_srcs",
+    srcs = glob(["**/*.mojo"]),
+)
+
+mojo_overlay_layer(
+    name = "std_base_layer",
+    srcs = ["@@//oss/modular/mojo/stdlib/std:std_srcs"],
+    strip_prefix = "oss/modular/mojo/stdlib/std/",
+)
+
+mojo_overlay_layer(
+    name = "std_overlay_layer",
+    srcs = [":overlay_srcs"],
+    strip_prefix = "stdlib/std/",
+)
+
+# Compile Hexagon HVX intrinsics to bitcode, once per QAIC arch (v68 = aic100,
+# v81 = aic200).
+#
+# QFloat is enabled per arch. v68 uses the `-mhvx-qfloat` driver flag; on v81
+# that flag also forwards an `-mllvm -fast-math=true` the Hexagon backend does
+# not accept, so v81 enables the qfloat target feature and mode directly.
+_HVX_QFLOAT_FLAGS = {
+    "v68": "-mhvx-qfloat",
+    "v81": "-Xclang -target-feature -Xclang +hvx-qfloat " +
+           "-mllvm -hexagon-qfloat-mode=lossy",
+}
+
+[
+    genrule(
+        name = "IntrinsicsHVX_%s_bc" % arch,
+        srcs = [
+            "@skye_dev_mlir//:IntrinsicsHVX_c",
+            "@skye_dev_sdk//:qhl_hvx_includes",
+            "@skye_dev_sdk//:tool_includes",
+            "@skye_dev_sdk//:hvx_internal_h",
+            "@skye_dev_sdk//:skye_dev_sdk_types_h",
+        ],
+        outs = ["IntrinsicsHVX_%s.bc" % arch],
+        cmd = """
+HVX_H=$(location @skye_dev_sdk//:hvx_internal_h)
+QHL_INC=$$(dirname $$(dirname $$HVX_H))
+TYPES_H=$(location @skye_dev_sdk//:skye_dev_sdk_types_h)
+TOOL_INC=$$(dirname $$TYPES_H)
+$(location @@+llvm_configure+llvm-project//clang:clang) \
+    -target hexagon-unknown-linux-musl \
+    -m{arch} -mhvx {qfloat} \
+    -emit-llvm -c \
+    -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+    -I $$QHL_INC \
+    -I $$QHL_INC/internal \
+    -I $$TOOL_INC \
+    $(location @skye_dev_mlir//:IntrinsicsHVX_c) \
+    -o $@
+""".format(
+            arch = arch,
+            qfloat = _HVX_QFLOAT_FLAGS[arch],
+        ),
+        tools = ["@@+llvm_configure+llvm-project//clang:clang"],
+    )
+    for arch in [
+        "v68",
+        "v81",
+    ]
+]
+
+# Compile the QAIC unwind slot helpers (used by abort() / make_npu_wrapper),
+# once per QAIC arch.
+[
+    genrule(
+        name = "qaic_unwind_%s_bc" % arch,
+        srcs = ["_plugin/qaic/qaic_unwind.c"],
+        outs = ["qaic_unwind_%s.bc" % arch],
+        cmd = """
+$(location @@+llvm_configure+llvm-project//clang:clang) \
+    -target hexagon-unknown-linux-musl \
+    -m%s \
+    -emit-llvm -c \
+    -fPIC -fvisibility=hidden \
+    $(location _plugin/qaic/qaic_unwind.c) \
+    -o $@
+""" % arch,
+        tools = ["@@+llvm_configure+llvm-project//clang:clang"],
+    )
+    for arch in [
+        "v68",
+        "v81",
+    ]
+]
+
+# Build the QAIC-augmented stdlib by merging monorepo base sources with
+# plugin overlay/QAIC-only files into a single directory tree, then running
+# mojo precompile via the Mojo toolchain. This merge is necessary because
+# mojo precompile takes a single root directory — cross-repo filegroups in
+# different sandbox directories can't be combined directly.
+#
+# Build: ./bazelw build @plugin//stdlib/std --config=plugin
+mojo_merged_precompile(
+    name = "std",
+    bitcode_libs = select({
+        "//:qaic_arch_aic200": [
+            ":IntrinsicsHVX_v81_bc",
+            ":qaic_unwind_v81_bc",
+        ],
+        "//conditions:default": [
+            ":IntrinsicsHVX_v68_bc",
+            ":qaic_unwind_v68_bc",
+        ],
+    }),
+    copts = IGNORED_POINTER_DEPRECATIONS_COPTS,
+    layers = [
+        ":std_base_layer",
+        ":std_overlay_layer",
+    ],
+    # Mirrors @@//oss/modular/mojo/stdlib/std:std, whose place this takes under
+    # --config=plugin: the stdlib is what calls into CompilerRT.
+    deps = ["@@//KGEN:CompilerRT"],
+)
