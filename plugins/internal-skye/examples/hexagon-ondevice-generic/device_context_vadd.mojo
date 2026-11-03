@@ -292,38 +292,44 @@ def main() raises:
     var passed = 0
     var failed = 0
 
-    def record(ok: Bool):
-        if ok:
-            passed += 1
-        else:
-            failed += 1
-
     # Core sizes: 17 exercises the scalar tail, 256 fills eight HVX registers,
     # 257 exercises both.
-    for n in List[Int](17, 256, 257):
+    for n in [17, 256, 257]:
         try:
-            record(run_vadd_size(ctx, n))
+            if run_vadd_size(ctx, n):
+                passed += 1
+            else:
+                failed += 1
         except e:
             print("vadd n=", n, ": raised: ", e, sep="")
             failed += 1
 
     # Interior slice: 257-element allocation, 129-element active window offset by 64.
     try:
-        record(run_vadd_slice(ctx, 257, 64, 129))
+        if run_vadd_slice(ctx, 257, 64, 129):
+            passed += 1
+        else:
+            failed += 1
     except e:
         print("vadd_slice: raised: ", e, sep="")
         failed += 1
 
     # Negative count must be refused.
     try:
-        record(run_vadd_negative_count(ctx))
+        if run_vadd_negative_count(ctx):
+            passed += 1
+        else:
+            failed += 1
     except e:
         print("vadd_negative_count: raised: ", e, sep="")
         failed += 1
 
     # Unknown selector must be refused.
     try:
-        record(run_unknown_selector(ctx))
+        if run_unknown_selector(ctx):
+            passed += 1
+        else:
+            failed += 1
     except e:
         print("unknown_selector: raised: ", e, sep="")
         failed += 1
