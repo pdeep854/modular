@@ -16,9 +16,13 @@ Provides: DeviceContext, HostBuffer, DeviceBuffer, DeviceExternalFunction, Dim.
 Only the subset of the API used by the hexagon on-device NPU tests is here.
 """
 
-from std.collections import InlineArray
 from std.ffi import external_call, c_uint
-from std.memory import Pointer, MutUntrackedOrigin, alloc
+from std.memory import (
+    Pointer,
+    MutUntrackedOrigin,
+    unsafe_alloc,
+    unsafe_stack_allocation,
+)
 from std.sys import size_of
 
 
@@ -161,7 +165,7 @@ struct DeviceContext(Copyable):
         var handle = Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0)
         var err = external_call[
             "AsyncRT_DeviceContext_create",
-            Pointer[UInt8, MutUntrackedOrigin],
+            Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](
             Pointer(to=handle),
             api.unsafe_ptr(),
@@ -182,7 +186,7 @@ struct DeviceContext(Copyable):
         Returns:
             A `HostBuffer` wrapping the allocation.
         """
-        return HostBuffer[dtype](alloc[Scalar[dtype]](n), n)
+        return HostBuffer[dtype](unsafe_alloc[Scalar[dtype]](n), n)
 
     def enqueue_create_buffer[dtype: DType](
         self, n: Int
@@ -195,7 +199,7 @@ struct DeviceContext(Copyable):
         Returns:
             A `DeviceBuffer` wrapping the allocation.
         """
-        return DeviceBuffer[dtype](alloc[Scalar[dtype]](n), n)
+        return DeviceBuffer[dtype](unsafe_alloc[Scalar[dtype]](n), n)
 
     def synchronize(self) raises:
         """Blocks until all enqueued NPU operations complete.
@@ -205,7 +209,7 @@ struct DeviceContext(Copyable):
         """
         var err = external_call[
             "AsyncRT_DeviceContext_synchronize",
-            Pointer[UInt8, MutUntrackedOrigin],
+            Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](self._handle)
         if err:
             raise Error("AsyncRT_DeviceContext_synchronize failed")
@@ -240,7 +244,7 @@ struct DeviceContext(Copyable):
         var empty = String("")
         var err = external_call[
             "AsyncRT_DeviceContext_loadFunction",
-            Pointer[UInt8, MutUntrackedOrigin],
+            Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](
             Pointer(to=func_handle),
             self._handle,
@@ -278,18 +282,18 @@ struct DeviceContext(Copyable):
             Error if AsyncRT_DeviceContext_enqueueFunctionDirect fails.
         """
         comptime num_args = Ts.length
-        var dense_args = InlineArray[Pointer[NoneType, MutUntrackedOrigin], num_args](
-            uninitialized=True
-        )
+        var dense_args = unsafe_stack_allocation[
+            num_args, Pointer[NoneType, MutUntrackedOrigin]
+        ]()
         comptime for i in range(num_args):
-            dense_args[i] = (
+            dense_args[unsafe_offset=i] = (
                 Pointer(to=args[i])
                 .unsafe_bitcast[NoneType]()
                 .unsafe_origin_cast[MutUntrackedOrigin]()
             )
         var err = external_call[
             "AsyncRT_DeviceContext_enqueueFunctionDirect",
-            Pointer[UInt8, MutUntrackedOrigin],
+            Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](
             self._handle,
             f._handle,
@@ -302,7 +306,7 @@ struct DeviceContext(Copyable):
             c_uint(0),
             Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0),
             c_uint(0),
-            dense_args.unsafe_ptr(),
+            dense_args,
             c_uint(num_args),
             Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=0),
         )
