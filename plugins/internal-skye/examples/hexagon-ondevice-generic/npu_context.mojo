@@ -120,7 +120,7 @@ struct DeviceBuffer[dtype: DType](Copyable):
     def size(self) -> Int:
         return len(self._data)
 
-    def enqueue_copy_from(self, src: HostBuffer[Self.dtype]):
+    def enqueue_copy_from(mut self, src: HostBuffer[Self.dtype]):
         var n = len(self._data) if len(self._data) < src.size() else src.size()
         for i in range(n):
             self._data[i] = src._data[i]
