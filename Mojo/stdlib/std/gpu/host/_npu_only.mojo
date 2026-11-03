@@ -17,12 +17,9 @@ Only the subset of the API used by the hexagon on-device NPU tests is here.
 """
 
 from std.ffi import external_call, c_uint
-from std.memory import (
-    Pointer,
-    MutUntrackedOrigin,
-    unsafe_alloc,
-    unsafe_stack_allocation,
-)
+from std.memory import Pointer, unsafe_stack_allocation
+from std.memory.alloc import unsafe_alloc
+from std.origin import MutUntrackedOrigin
 from std.sys import size_of
 
 
@@ -162,18 +159,20 @@ struct DeviceContext(Copyable):
         Raises:
             Error if AsyncRT_DeviceContext_create returns a non-null error.
         """
-        var handle = Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0)
+        var handle_int: Int = 0
         var err = external_call[
             "AsyncRT_DeviceContext_create",
             Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](
-            Pointer(to=handle),
+            Pointer(to=handle_int),
             api.unsafe_ptr(),
             Int32(0),
         )
         if err:
             raise Error("AsyncRT_DeviceContext_create failed")
-        self._handle = handle
+        self._handle = Pointer[NoneType, MutUntrackedOrigin](
+            unsafe_from_address=handle_int
+        )
 
     def enqueue_create_host_buffer[dtype: DType](
         self, n: Int
@@ -240,13 +239,13 @@ struct DeviceContext(Copyable):
         Raises:
             Error if AsyncRT_DeviceContext_loadFunction returns a non-null error.
         """
-        var func_handle = Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0)
+        var func_handle_int: Int = 0
         var empty = String("")
         var err = external_call[
             "AsyncRT_DeviceContext_loadFunction",
             Optional[Pointer[UInt8, MutUntrackedOrigin]],
         ](
-            Pointer(to=func_handle),
+            Pointer(to=func_handle_int),
             self._handle,
             empty.unsafe_ptr(),
             function_name.unsafe_ptr(),
@@ -258,7 +257,11 @@ struct DeviceContext(Copyable):
         )
         if err:
             raise Error("AsyncRT_DeviceContext_loadFunction failed")
-        return DeviceExternalFunction(func_handle)
+        return DeviceExternalFunction(
+            Pointer[NoneType, MutUntrackedOrigin](
+                unsafe_from_address=func_handle_int
+            )
+        )
 
     def enqueue_function[*Ts: AnyType](
         self,
@@ -304,11 +307,11 @@ struct DeviceContext(Copyable):
             c_uint(1),
             c_uint(1),
             c_uint(0),
-            Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0),
+            Optional[Pointer[NoneType, MutUntrackedOrigin]](None),
             c_uint(0),
             dense_args,
             c_uint(num_args),
-            Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=0),
+            Optional[Pointer[UInt64, MutUntrackedOrigin]](None),
         )
         if err:
             raise Error("AsyncRT_DeviceContext_enqueueFunctionDirect failed")
