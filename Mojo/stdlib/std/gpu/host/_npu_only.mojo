@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Minimal DeviceContext stub for NPU testing on Mojo 1.3.0.dev0.
+"""Minimal DeviceContext stub for NPU testing.
 
 Provides: DeviceContext, HostBuffer, DeviceBuffer, DeviceExternalFunction, Dim.
 Only the subset of the API used by the hexagon on-device NPU tests is here.
@@ -18,7 +18,7 @@ Only the subset of the API used by the hexagon on-device NPU tests is here.
 
 from std.collections import InlineArray
 from std.ffi import external_call, c_uint
-from std.memory import Pointer
+from std.memory import Pointer, MutUntrackedOrigin, alloc
 from std.sys import size_of
 
 
@@ -65,31 +65,26 @@ struct Dim(Copyable):
 
 
 struct HostBuffer[dtype: DType](Copyable):
-    """Host-accessible buffer.
+    """Host-accessible buffer backed by a heap allocation."""
 
-    On Hexagon/CDSP the host and device share physical memory, so the same
-    allocation serves both `enqueue_create_host_buffer` and
-    `enqueue_create_buffer`.
-    """
-
-    var _ptr: Pointer[Scalar[Self.dtype], MutAnyOrigin]
+    var _ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
     var _n: Int
 
     def __init__(
         out self,
-        ptr: Pointer[Scalar[Self.dtype], MutAnyOrigin],
+        ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin],
         n: Int,
     ):
         self._ptr = ptr
         self._n = n
 
     def __getitem__(self, i: Int) -> Scalar[Self.dtype]:
-        return self._ptr[i]
+        return self._ptr[unsafe_offset=i]
 
     def __setitem__(mut self, i: Int, v: Scalar[Self.dtype]):
-        self._ptr[i] = v
+        self._ptr[unsafe_offset=i] = v
 
-    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutAnyOrigin]:
+    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutUntrackedOrigin]:
         return self._ptr
 
 
@@ -101,34 +96,33 @@ struct HostBuffer[dtype: DType](Copyable):
 struct DeviceBuffer[dtype: DType](Copyable):
     """On-device buffer.
 
-    On Hexagon/CDSP the host and device share the same physical memory, but
-    `enqueue_create_host_buffer` and `enqueue_create_buffer` produce separate
-    allocations, so the copy methods perform an element-wise CPU copy.
+    Host and device buffers are separate allocations. The copy methods perform
+    an element-wise CPU copy to transfer data between them.
     """
 
-    var _ptr: Pointer[Scalar[Self.dtype], MutAnyOrigin]
+    var _ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
     var _n: Int
 
     def __init__(
         out self,
-        ptr: Pointer[Scalar[Self.dtype], MutAnyOrigin],
+        ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin],
         n: Int,
     ):
         self._ptr = ptr
         self._n = n
 
-    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutAnyOrigin]:
+    def unsafe_ptr(self) -> Pointer[Scalar[Self.dtype], MutUntrackedOrigin]:
         return self._ptr
 
     def enqueue_copy_from(self, src: HostBuffer[Self.dtype]):
         var n = self._n if self._n < src._n else src._n
         for i in range(n):
-            self._ptr[i] = src._ptr[i]
+            self._ptr[unsafe_offset=i] = src._ptr[unsafe_offset=i]
 
     def enqueue_copy_to(self, mut dst: HostBuffer[Self.dtype]):
         var n = self._n if self._n < dst._n else dst._n
         for i in range(n):
-            dst._ptr[i] = self._ptr[i]
+            dst._ptr[unsafe_offset=i] = self._ptr[unsafe_offset=i]
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +133,9 @@ struct DeviceBuffer[dtype: DType](Copyable):
 struct DeviceExternalFunction(Copyable):
     """Handle to a kernel resolved by name via AsyncRT loadFunction."""
 
-    var _handle: Pointer[NoneType, MutAnyOrigin]
+    var _handle: Pointer[NoneType, MutUntrackedOrigin]
 
-    def __init__(out self, handle: Pointer[NoneType, MutAnyOrigin]):
+    def __init__(out self, handle: Pointer[NoneType, MutUntrackedOrigin]):
         self._handle = handle
 
 
@@ -153,7 +147,7 @@ struct DeviceExternalFunction(Copyable):
 struct DeviceContext(Copyable):
     """Host-side handle to the NPU (Hexagon CDSP) via AsyncRT."""
 
-    var _handle: Pointer[NoneType, MutAnyOrigin]
+    var _handle: Pointer[NoneType, MutUntrackedOrigin]
 
     def __init__(out self, *, api: String) raises:
         """Creates an AsyncRT device context for the given API string.
@@ -164,10 +158,10 @@ struct DeviceContext(Copyable):
         Raises:
             Error if AsyncRT_DeviceContext_create returns a non-null error.
         """
-        var handle = Pointer[NoneType, MutAnyOrigin]()
+        var handle = Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0)
         var err = external_call[
             "AsyncRT_DeviceContext_create",
-            Pointer[UInt8, MutAnyOrigin],
+            Pointer[UInt8, MutUntrackedOrigin],
         ](
             Pointer(to=handle),
             api.unsafe_ptr(),
@@ -182,25 +176,18 @@ struct DeviceContext(Copyable):
     ) -> HostBuffer[dtype]:
         """Allocates a host-accessible buffer of `n` elements.
 
-        On Hexagon/CDSP shared memory this allocation is also device-visible.
-
         Args:
             n: Number of elements.
 
         Returns:
             A `HostBuffer` wrapping the allocation.
         """
-        var ptr = Pointer[Scalar[dtype]].alloc(n)
-        return HostBuffer[dtype](
-            ptr.unsafe_mut_cast[True]().as_unsafe_any_origin(), n
-        )
+        return HostBuffer[dtype](alloc[Scalar[dtype]](n), n)
 
     def enqueue_create_buffer[dtype: DType](
         self, n: Int
     ) -> DeviceBuffer[dtype]:
         """Allocates a device buffer of `n` elements.
-
-        On Hexagon/CDSP shared memory this allocation is also host-visible.
 
         Args:
             n: Number of elements.
@@ -208,10 +195,7 @@ struct DeviceContext(Copyable):
         Returns:
             A `DeviceBuffer` wrapping the allocation.
         """
-        var ptr = Pointer[Scalar[dtype]].alloc(n)
-        return DeviceBuffer[dtype](
-            ptr.unsafe_mut_cast[True]().as_unsafe_any_origin(), n
-        )
+        return DeviceBuffer[dtype](alloc[Scalar[dtype]](n), n)
 
     def synchronize(self) raises:
         """Blocks until all enqueued NPU operations complete.
@@ -221,7 +205,7 @@ struct DeviceContext(Copyable):
         """
         var err = external_call[
             "AsyncRT_DeviceContext_synchronize",
-            Pointer[UInt8, MutAnyOrigin],
+            Pointer[UInt8, MutUntrackedOrigin],
         ](self._handle)
         if err:
             raise Error("AsyncRT_DeviceContext_synchronize failed")
@@ -239,9 +223,6 @@ struct DeviceContext(Copyable):
     ) raises -> DeviceExternalFunction:
         """Resolves a kernel by name from NPUKernels.def via AsyncRT.
 
-        Passing `asm=""` makes the runtime look the name up in its built-in
-        registry rather than JIT-compiling provided assembly.
-
         Parameters:
             sig: Unused type parameter; kept for API compatibility.
 
@@ -255,11 +236,11 @@ struct DeviceContext(Copyable):
         Raises:
             Error if AsyncRT_DeviceContext_loadFunction returns a non-null error.
         """
-        var func_handle = Pointer[NoneType, MutAnyOrigin]()
+        var func_handle = Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0)
         var empty = String("")
         var err = external_call[
             "AsyncRT_DeviceContext_loadFunction",
-            Pointer[UInt8, MutAnyOrigin],
+            Pointer[UInt8, MutUntrackedOrigin],
         ](
             Pointer(to=func_handle),
             self._handle,
@@ -284,9 +265,6 @@ struct DeviceContext(Copyable):
     ) raises:
         """Dispatches `f` on the NPU with the given grid/block dimensions.
 
-        Each argument is forwarded by address via the FAM protocol:
-        `args[i]` points at the i-th user argument value.
-
         Parameters:
             *Ts: Compile-time types of the variadic arguments.
 
@@ -300,19 +278,18 @@ struct DeviceContext(Copyable):
             Error if AsyncRT_DeviceContext_enqueueFunctionDirect fails.
         """
         comptime num_args = Ts.length
-        var dense_args = InlineArray[Pointer[NoneType, MutAnyOrigin], num_args](
+        var dense_args = InlineArray[Pointer[NoneType, MutUntrackedOrigin], num_args](
             uninitialized=True
         )
         comptime for i in range(num_args):
             dense_args[i] = (
                 Pointer(to=args[i])
                 .unsafe_bitcast[NoneType]()
-                .unsafe_mut_cast[True]()
-                .as_unsafe_any_origin()
+                .unsafe_origin_cast[MutUntrackedOrigin]()
             )
         var err = external_call[
             "AsyncRT_DeviceContext_enqueueFunctionDirect",
-            Pointer[UInt8, MutAnyOrigin],
+            Pointer[UInt8, MutUntrackedOrigin],
         ](
             self._handle,
             f._handle,
@@ -323,11 +300,11 @@ struct DeviceContext(Copyable):
             c_uint(1),
             c_uint(1),
             c_uint(0),
-            Pointer[NoneType, MutAnyOrigin](),
+            Pointer[NoneType, MutUntrackedOrigin](unsafe_from_address=0),
             c_uint(0),
             dense_args.unsafe_ptr(),
             c_uint(num_args),
-            Pointer[UInt64, MutAnyOrigin](),
+            Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=0),
         )
         if err:
             raise Error("AsyncRT_DeviceContext_enqueueFunctionDirect failed")
